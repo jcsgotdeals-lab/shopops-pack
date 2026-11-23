@@ -15,6 +15,12 @@ jobs:
     environment: { name: github-pages, url: '${{ steps.d.outputs.page_url }}' }
     steps:
       - uses: actions/checkout@v4
+      - name: Download Firebase (team sync)
+        run: |
+          V=10.14.1; mkdir -p app/vendor/firebase
+          for m in app firestore auth; do curl -fsSL "https://www.gstatic.com/firebasejs/$V/firebase-$m.js" -o "app/vendor/firebase/firebase-$m.js"; done
+          sed -i "s#https://www.gstatic.com/firebasejs/$V/#./#g" app/vendor/firebase/*.js
+          if grep -l "gstatic.com/firebasejs" app/vendor/firebase/*.js; then echo "Firebase files still point online"; exit 1; fi
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with: { path: app }
