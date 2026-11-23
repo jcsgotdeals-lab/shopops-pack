@@ -1,6 +1,6 @@
 # ShopOps Pack
 
-Packing app for TikTok Shop LIVE auctions. Every sold item gets a numbered sticker. After the show, each buyer gets a numbered tray, and you pack trays by scanning. Runs on Android phones and on any computer (Mac, Windows, Chromebook) from the same code. All data stays on the device.
+Packing app for TikTok Shop LIVE auctions. Every sold item gets a numbered sticker. After the show, each buyer gets a numbered tray, and you pack trays by scanning. Runs on Android phones and on any computer (Mac, Windows, Chromebook) from the same code. All devices signed in to the team login share the same data, live.
 
 ## How a show works
 
@@ -42,7 +42,7 @@ The APK is unsigned for store use (debug build). That's fine for your own phones
 ## Limits in this version
 
 - TikTok only, from its PDF and CSV exports. There's no live sale capture for Whatnot or eBay Live.
-- One device per show. There's no real-time team sync between packers yet.
+- Team sync: every phone and computer signed in to the team login sees the same data live (Firebase). Each device keeps an offline copy and catches up when back online.
 - The PDF reader was tested with a mock TikTok packing slip. Send a real (redacted) PDF from Seller Center to tune it to the exact layout.
 
 ## Project layout
