@@ -32,10 +32,18 @@ jobs:
           npx cap add android
           bash android-extras/patch-android.sh
           npx cap sync android
+      - name: Use the fixed signing key (so updates install over the old app)
+        env:
+          KS: ${{ secrets.ANDROID_DEBUG_KEYSTORE }}
+        run: |
+          if [ -n "$KS" ]; then mkdir -p ~/.android && echo "$KS" | base64 -d > ~/.android/debug.keystore && echo "Fixed key in place"; else echo "No signing secret yet - using a one-off key"; fi
       - name: Build APK
         working-directory: android
         run: |
           chmod +x gradlew
+          VER=$(grep -o "APP_VERSION = '[^']*'" ../app/src/app.js | cut -d"'" -f2)
+          sed -i "s/versionCode [0-9]*/versionCode $GITHUB_RUN_NUMBER/; s/versionName \"[^\"]*\"/versionName \"${VER:-1.0}\"/" app/build.gradle
+          grep -E "versionCode|versionName" app/build.gradle
           ./gradlew assembleDebug --no-daemon
           cp app/build/outputs/apk/debug/app-debug.apk ../JC-Got-Trays.apk
       - uses: actions/upload-artifact@v4
