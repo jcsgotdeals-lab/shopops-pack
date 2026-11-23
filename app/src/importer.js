@@ -87,6 +87,15 @@ export function findNickname(lines) {
   return '';
 }
 
+// "In transit by: 11/25/2026 11:59 PM" (TikTok) / "Ship by: ..." -> epoch ms (local time)
+export function findShipBy(text) {
+  const m = String(text || '').match(/(?:in\s*transit\s*by|ship\s*by)\s*[:\-]?\s*(\d{1,2})\/(\d{1,2})\/(\d{2,4})(?:\s+(\d{1,2}):(\d{2})(?::\d{2})?\s*([AP]M)?)?/i);
+  if (!m) return 0;
+  let [, mo, d, y, h, mi, ap] = m; y = +y < 100 ? 2000 + +y : +y; h = h == null ? 23 : +h; mi = mi == null ? 59 : +mi;
+  if (ap) { ap = ap.toUpperCase(); if (ap === 'PM' && h < 12) h += 12; if (ap === 'AM' && h === 12) h = 0; }
+  const t = new Date(y, +mo - 1, +d, h, mi).getTime();
+  return isFinite(t) ? t : 0;
+}
 export function buyerKey(name) {
   return String(name || '').toLowerCase().replace(/^@/, '').replace(/[^a-z0-9]+/g, '');
 }
@@ -166,6 +175,7 @@ export async function parsePdfs(files, onProgress) {
         if (!o) { o = { orderId: oid, extraOrderIds: ids.slice(1), buyer: '', items: [], slipPages: [], labelPages: [], tracking: [], firstSeq: seq.length, fileIdx }; orders.set(oid, o); }
         o.buyer = o.buyer || findBuyer(p.lines);
         o.nickname = o.nickname || findNickname(p.lines);
+        if (!o.shipBy) { const sb = findShipBy(p.text); if (sb) o.shipBy = sb; }
         slipTracking.forEach(t => { if (!o.tracking.includes(t)) o.tracking.push(t); });
         for (const it of findItems(p.text)) if (!o.items.some(x => x.num === it.num && nameKey(x.name) === nameKey(it.name))) o.items.push(it);
         o.slipPages.push({ fileId: f.id, pageIndex: p.pageIndex });
@@ -274,7 +284,7 @@ export function planShow(orders) {
   const trays = [], items = [];
   list.forEach((c, i) => {
     const n = i + 1;
-    const t = { n, buyer: c.o.buyer || 'Unknown buyer', nickname: c.o.nickname || '', buyerKey: c.o.buyerKey, orderIds: [c.o.orderId], items: [], tracking: [...(c.o.tracking || [])], part: 0 };
+    const t = { n, buyer: c.o.buyer || 'Unknown buyer', nickname: c.o.nickname || '', buyerKey: c.o.buyerKey, orderIds: [c.o.orderId], items: [], tracking: [...(c.o.tracking || [])], shipBy: c.o.shipBy || 0, part: 0 };
     c.items.forEach((x, j) => {
       const id = `${n}-${j}`;
       items.push({ id, num: x.num, name: x.name, code: x.num != null ? stickerCode(x.name, x.num) : '', title: x.title, price: x.price || 0, tray: n, orderId: x.orderId, noNum: !!x.noNum });
@@ -282,6 +292,6 @@ export function planShow(orders) {
     });
     trays.push(t);
   });
-  const slim = orders.map(o => ({ orderId: o.orderId, extraOrderIds: o.extraOrderIds, buyer: o.buyer, nickname: o.nickname, buyerKey: o.buyerKey, slipPages: o.slipPages, labelPages: o.labelPages, tracking: o.tracking, firstSeq: o.firstSeq, fileIdx: o.fileIdx }));
+  const slim = orders.map(o => ({ orderId: o.orderId, extraOrderIds: o.extraOrderIds, buyer: o.buyer, nickname: o.nickname, buyerKey: o.buyerKey, slipPages: o.slipPages, labelPages: o.labelPages, tracking: o.tracking, firstSeq: o.firstSeq, fileIdx: o.fileIdx, shipBy: o.shipBy || 0 }));
   return { trays, items, orders: slim };
 }

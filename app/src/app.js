@@ -3,13 +3,13 @@
 import * as db from './db.js';
 import { S, setShowId, prefs, hideRev, stopCamera, openShow } from './ctx.js';
 import { counts, pct, pctFloor, buildState, METHOD_LABEL, nameKey } from './state.js';
-import { $, $$, esc, view, at, toast, fmtDateStr, fmtWhen, ago, dur, money, nf, modal, confirmTap, saveFile, printPdf, readFile, readText, isPhone } from './ui.js';
+import { $, $$, esc, view, at, toast, fmtDateStr, fmtWhen, fmtDeadline, ago, dur, money, nf, modal, confirmTap, saveFile, printPdf, readFile, readText, isPhone } from './ui.js';
 import { parsePdfs, ordersFromCsv, planShow } from './importer.js';
 import { preShowPdf } from './labels.js';
 import { qrSvg } from './qr.js';
 import { viewDash, viewShow, noShow, showReport, phoneModal } from './views-show.js';
 
-const APP_VERSION = '1.3.0';
+const APP_VERSION = '1.4.0';
 const appUrl = () => location.origin + location.pathname;
 const OWNER_NAME = 'JULIAN';
 
@@ -283,7 +283,11 @@ function viewImport() {
       for (const f of csvs) parsed.orders.push(...ordersFromCsv(await readText(f)).orders);
       prog.textContent = '';
       if (!parsed.orders.length) return toast("No packing slips were found in these files. Make sure the PDF includes packing slips (TikTok: 'Shipping label and packing list').", 'error');
-      const first = files[0].name.replace(/\.(pdf|csv)$/i, '');
+      const base = f => f.name.replace(/\.(pdf|csv)$/i, '');
+      let common = base(files[0]);
+      for (const f of files.slice(1)) { const b = base(f); let i = 0; while (i < common.length && common[i] === b[i]) i++; common = common.slice(0, i); }
+      if (files.length > 1 && common.trim().length >= 3) common = common.replace(/[\s_-]*(?:part|pt)?[\s_-]*$/i, ''); else common = base(files[0]);
+      const first = common.replace(/[\s_-]*\(\d+\)$/, '').replace(/[\s_-]*(?:part|pt)[\s_-]*\d+(?:[\s_-]*of[\s_-]*\d+)?$/i, '').trim();
       pending = { files: stored, parsed, platform: plat, name: /^\d|label|slip|print|order/i.test(first) ? `Show ${fmtDateStr(today())}` : first, date: today() };
       drawPreview();
     } catch (err) { console.error(err); prog.textContent = ''; toast('Could not read the file: ' + err.message, 'error'); }
@@ -308,12 +312,15 @@ function drawPreview() {
     ${withLabel < p.parsed.orders.length && p.parsed.labelPages ? `<p class="notice">${p.parsed.orders.length - withLabel} order${p.parsed.orders.length - withLabel === 1 ? '' : 's'} had no shipping label in the PDF.</p>` : ''}
     ${!p.parsed.labelPages && p.files.length ? '<p class="notice">Packing slips only — add the shipping labels later on the show\'s Labels step.</p>' : ''}
     ${plan.trays.length > buyers ? `<p class="muted small">${plan.trays.length - buyers} buyer${plan.trays.length - buyers === 1 ? ' has' : 's have'} more than one package, so they get one tray per package (each package has its own label).</p>` : ''}
+    ${shipByOf(p.parsed.orders) ? `<p class="muted small">Ship by <b>${esc(fmtDeadline(shipByOf(p.parsed.orders)))}</b> (TikTok's "In transit by" on the slips).</p>` : ''}
+    <div id="dup"></div>
     <div class="grid2"><label>Show name<input id="pv-name" value="${esc(p.name)}"></label><label>Show date<input id="pv-date" type="date" value="${esc(p.date)}"></label></div>
     <details><summary>See the trays (${plan.trays.length})</summary><div class="table-wrap"><table class="tbl"><thead><tr><th>Tray</th><th>Buyer</th><th>Items</th><th>Stickers</th></tr></thead><tbody>
       ${plan.trays.map(t => `<tr><td><b>${t.n}</b></td><td>${esc(at(t.buyer))}${t.part ? ' <span class="muted small">(part ' + (t.part + 1) + ')</span>' : ''}</td><td>${t.items.length}</td><td class="small">${t.items.map(id => plan.items.find(i => i.id === id)).map(i => (i.num != null ? '#' + i.num : '—')).join(', ')}</td></tr>`).join('')}
     </tbody></table></div></details>
     <div class="row"><button class="btn primary" id="create">Create show</button><button class="btn ghost" id="discard">Discard</button></div>
   </section>`;
+  checkDuplicates(p.parsed.orders);
   $('#pv-name').oninput = e => { p.name = e.target.value; };
   $('#pv-date').oninput = e => { p.date = e.target.value; };
   $('#discard').onclick = () => { pending = null; viewImport(); };
@@ -322,12 +329,31 @@ function drawPreview() {
     const show = {
       id, name: (p.name || '').trim() || 'Show', date: p.date || today(), platform: p.platform, createdAt: Date.now(),
       trayCount: plan.trays.length, itemCount: plan.items.length, hasLabels: plan.orders.some(o => o.labelPages.length), noNumber: noNum.length,
+      shipBy: shipByOf(p.parsed.orders),
     };
     await db.createShow(show, plan, p.files.map(f => ({ ...f, showId: id })));
     pending = null; setShowId(id);
     toast(`${plan.trays.length} trays ready`, 'ok');
     location.hash = '#show/' + id + '/overview';
   };
+}
+// Earliest "In transit by" deadline across the orders (0 when the slips don't say)
+function shipByOf(orders) { const t = orders.map(o => o.shipBy || 0).filter(Boolean); return t.length ? Math.min(...t) : 0; }
+// Warn when some of these orders were already imported into another show (same PDF uploaded twice).
+async function checkDuplicates(orders) {
+  const box = $('#dup'); if (!box) return;
+  const ids = new Set(orders.map(o => o.orderId));
+  const hits = [];
+  const recent = db.shows().filter(s => !s.sample).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)).slice(0, 30);
+  for (const s of recent) {
+    try {
+      const d = await db.showData(s.id);
+      const n = (d?.orders || []).filter(o => ids.has(o.orderId)).length;
+      if (n) hits.push([s, n]);
+    } catch (e) { /* skip */ }
+  }
+  if (!hits.length || !$('#dup')) return;
+  $('#dup').innerHTML = `<p class="notice">Heads up: ${hits.map(([s, n]) => `<b>${n}</b> of these orders ${n === 1 ? 'is' : 'are'} already in <a href="#show/${esc(s.id)}/overview">${esc(s.name)}</a>`).join('; ')}. If you uploaded the same PDF twice, tap Discard.</p>`;
 }
 // A practice show with made-up orders
 async function makeSample() {
@@ -583,6 +609,9 @@ function viewHelp() {
   <section class="panel"><h2>Questions</h2>
     ${q('A sticker says "Not in this show"', 'Check you picked the right show (tap the show name), and that the listing name on the sticker matches the one in TikTok. You can also type just the number and press Enter.')}
     ${q('"More than one match"', 'Two listing names used the same number. Scan the barcode instead of typing, so the name is included.')}
+    ${q('Can I use my old Scan2Tray stickers?', 'Yes. Scan2Tray stickers (like HSQ#602) scan straight in — the letters pick the right listing and the number finds the item. Our own pre-show stickers use the same style.')}
+    ${q('Two PDFs for one show (part 1 and part 2)', 'Pick both files at once on the import page. They become one show, and the "part 1 / part 2" bit is left out of the name.')}
+    ${q('Ship-by deadline', 'TikTok prints an "In transit by" date on each packing slip. The show page shows it with a countdown, and turns amber in the last 24 hours and red when late.')}
     ${q('An item is damaged, missing or cancelled', 'Open the tray, tap ⋯ next to the item and pick Mark as damaged / missing / on the floor / cancelled. Cancelled items no longer count towards the tray.')}
     ${q('I scanned the wrong thing', 'Tap Undo. It takes back your last scan on this device. On the computer, ▾ next to Undo can reset every tray in the show.')}
     ${q('Does it work without internet?', 'Yes. Scans are saved on the device and sync to everyone as soon as the connection is back.')}

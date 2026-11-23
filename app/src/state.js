@@ -14,14 +14,13 @@ export const METHOD_LABEL = { camera: 'Phone camera', scanner: 'Barcode scanner'
 
 export function normCode(s) { return String(s || '').trim().toUpperCase().replace(/\s+/g, ''); }
 export function nameKey(s) { return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ''); }
-// Short code for a listing name, printed in the sticker barcode (e.g. "K3F9-67").
-export function nameHash(name) {
-  const k = nameKey(name);
-  let h = 2166136261;
-  for (let i = 0; i < k.length; i++) { h ^= k.charCodeAt(i); h = Math.imul(h, 16777619) >>> 0; }
-  return (h % 1679616).toString(36).toUpperCase().padStart(4, '0');
-}
-export const stickerCode = (name, n) => `${nameHash(name)}-${n}`;
+// Sticker barcode, same style as Scan2Tray's pre-show stickers: first 3 letters of the listing
+// name + "#" + number, e.g. "(H) SQUISHIES(Non-Branded)" #602 -> "HSQ#602". Stickers printed by
+// either app scan in both.
+export function nameLetters(name) { return (String(name || '').match(/[A-Za-z]/g) || []).slice(0, 3).join('').toUpperCase(); }
+export const stickerCode = (name, n) => `${nameLetters(name) || 'S'}#${n}`;
+// Show letter of a listing name: "(H) SQUISHIES" -> "H"
+const showLetter = name => { const m = String(name || '').match(/^\s*\(?\s*([A-Za-z])\s*\)/); return m ? m[1].toUpperCase() : (nameLetters(name)[0] || ''); };
 
 export function buildState(data, events) {
   const items = new Map((data.items || []).map(it => [it.id, { ...it, status: 'pending' }]));
@@ -76,8 +75,18 @@ export function resolve(st, raw) {
     const n = String(+m[1]);
     const cands = st.byNum.get(n) || [];
     if (cands.length) {
-      const h = code.match(/^([0-9A-Z]{4})-\d+$/);
-      if (h) { const same = cands.filter(c => c.code && normCode(c.code).startsWith(h[1] + '-')); if (same.length) return same; }
+      // "HSQ#602" (ours) or "DSN#825" (Scan2Tray label key): narrow by the letters, then by the show letter
+      const k = code.match(/^([A-Z]{1,4})#\d+$/);
+      if (k) {
+        const exact = cands.filter(c => nameLetters(c.name) === k[1]);
+        if (exact.length) return exact;
+        const sameShow = cands.filter(c => showLetter(c.name) === k[1][0]);
+        if (sameShow.length) return sameShow;
+        // a sticker from another show's listing (e.g. a "D" sticker in the "H" show) is not this item
+        if (cands.every(c => /^\s*\(\s*[A-Za-z]\s*\)/.test(c.name || ''))) return [];
+      }
+      const lead = String(raw).match(/^\s*\(\s*([A-Za-z])\s*\)/);
+      if (lead && cands.length > 1) { const same = cands.filter(c => showLetter(c.name) === lead[1].toUpperCase()); if (same.length) return same; }
       return cands;
     }
   }

@@ -6,7 +6,7 @@ import {
   counts, pct, pctFloor, resolve, trayForLabel, FLAGGED, STATUS_LABEL, people, methods, timeline, problemSummary,
   PROBLEM_RESULTS, TYPE_LABEL, RESULT_LABEL, METHOD_LABEL, busyMs, perHour,
 } from './state.js';
-import { $, $$, esc, view, at, toast, fmtTime, fmtDay, fmtDateStr, fmtWhen, ago, dur, money, nf, modal, confirmTap, saveFile, printPdf, readFile } from './ui.js';
+import { $, $$, esc, view, at, toast, fmtTime, fmtDay, fmtDateStr, fmtWhen, fmtDeadline, dueIn, itemName, ago, dur, money, nf, modal, confirmTap, saveFile, printPdf, readFile } from './ui.js';
 import { feedback } from './feedback.js';
 import { trayOrderPdf, trayLabelsPdf } from './labels.js';
 import { parseLabelsOnly } from './importer.js';
@@ -42,7 +42,7 @@ function trayTile(t, mode) {
 function itemRow(it) {
   return `<li class="item-row st-${it.status}">
     <span class="chip num">#${it.num ?? '?'}</span>
-    <div class="grow"><div>${esc(it.title || 'Item')}</div>
+    <div class="grow"><div>${esc(itemName(it) || 'Item')}</div>
       <div class="muted small">${it.trayAt ? 'Scanned ' + fmtTime(it.trayAt) + (it.trayBy ? ' · ' + esc(it.trayBy) : '') : 'Not scanned yet'}${it.packedAt ? ' · packed ' + fmtTime(it.packedAt) : ''}</div>
       <span class="status-pill st-${it.status}">${STATUS_LABEL[it.status]}</span></div>
     ${hideRev() ? '' : `<span class="small">${money(+it.price || 0)}</span>`}
@@ -145,7 +145,7 @@ export async function viewDash() {
 }
 
 // ---------- Show page (desktop) ----------
-function showHeader(s, tab) {
+function stepsInner(s, tab) {
   const st = S.cur.st, c = counts(st);
   const sortPct = pctFloor(c.inTray, c.items);
   const packLabel = c.boxesDone >= c.trays && c.trays ? 'Done' : c.boxesDone || c.packed ? `${c.boxesDone}/${c.trays} boxes` : 'Not started';
@@ -155,14 +155,27 @@ function showHeader(s, tab) {
     ['pack', '2', 'Pack & ship', packLabel],
   ];
   const on = tab === 'labels' || tab === 'handover' ? 'pack' : tab === 'trays' ? 'sort' : tab;
+  return steps.map(([k, n, l, sub]) => `<a class="step ${on === k ? 'on' : ''}" href="#show/${esc(s.id)}/${k}"><span class="step-n">${n}</span><span><b>${l}</b><span class="small">${sub}</span></span></a>`).join('<span class="step-line"></span>');
+}
+// Keep the step headers (Sort 42% · Pack 3/150 boxes) live while scanning.
+function updateSteps(s, tab) { const el = $('#steps'); if (el) el.innerHTML = stepsInner(s, tab); }
+// The show's ship-by deadline: saved at import, or read from the orders.
+export function shipByOf(s) {
+  if (s.shipBy) return s.shipBy;
+  const t = (S.cur?.id === s.id ? S.cur.data?.orders || [] : []).map(o => o.shipBy || 0).filter(Boolean);
+  return t.length ? Math.min(...t) : 0;
+}
+function showHeader(s, tab) {
+  const working = tab === 'sort' || tab === 'pack' || tab === 'handover';
+  const due = shipByOf(s), c = counts(S.cur.st), late = due && due < Date.now() && c.handed < c.trays;
   return `<div class="show-top">
     <a class="back desk" href="#shows">← All shows</a>
-    <div class="steps">${steps.map(([k, n, l, sub]) => `<a class="step ${on === k ? 'on' : ''}" href="#show/${esc(s.id)}/${k}"><span class="step-n">${n}</span><span><b>${l}</b><span class="small">${sub}</span></span></a>`).join('<span class="step-line"></span>')}</div>
+    <div class="steps" id="steps">${stepsInner(s, tab)}</div>
     <div class="row gap-s"><a class="help-link desk" href="#help">Get help with this show</a>
       <div class="menu-wrap"><button class="icon-btn" id="show-menu" aria-label="More">⋯</button></div></div>
   </div>
-  <div class="row between wrap show-title">
-    <div><div class="muted small">${fmtDateStr(s.date)} · ${s.platform === 'whatnot' ? 'Whatnot' : 'TikTok Shop'} · Imported ${ago(s.createdAt)}</div><h1>${esc(s.name)}</h1></div>
+  <div class="row between wrap show-title${working ? ' working' : ''}">
+    <div><div class="muted small"><span class="meta">${fmtDateStr(s.date)} · ${s.platform === 'whatnot' ? 'Whatnot' : 'TikTok Shop'} · Imported ${ago(s.createdAt)}${due ? ' · ' : ''}</span>${due ? `<span class="${late ? 'late' : due - Date.now() < 864e5 && c.handed < c.trays ? 'soon' : ''}">Ship by ${esc(fmtDeadline(due))}${c.handed < c.trays ? ' (' + dueIn(due) + ')' : ''}</span>` : ''}</div><h1>${esc(s.name)}</h1></div>
     ${S.owner ? `<div class="split"><button class="btn accent" id="print-main">⬇ Print Labels + Slips</button><button class="btn accent" id="print-more" aria-label="More print options">▾</button></div>` : ''}
   </div>`;
 }
@@ -248,6 +261,7 @@ async function tabOverview(s) {
           <a class="btn dark" href="#show/${esc(s.id)}/${next[4]}">${esc(next[5])}</a></div>
         <h3>Needs a look</h3>
         <ul class="look-list">
+          ${shipByOf(s) && c.handed < c.trays ? `<li><i class="dot ${shipByOf(s) < Date.now() ? 'red' : shipByOf(s) - Date.now() < 864e5 ? 'amber' : 'green'}"></i><div class="grow"><b>Ship by ${esc(fmtDeadline(shipByOf(s)))} · ${esc(dueIn(shipByOf(s)))}</b><div class="muted small">TikTok's "In transit by" deadline. ${c.trays - c.handed} parcel${c.trays - c.handed === 1 ? '' : 's'} not handed to the courier yet.</div></div></li>` : ''}
           ${waiting.length && c.inTray ? `<li><i class="dot blue"></i><div class="grow"><b>${waiting.length} tray${waiting.length === 1 ? ' is' : 's are'} still waiting for items</b><div class="muted small">Scan the rest of the items, or check what is missing.</div></div><a href="#show/${esc(s.id)}/trays?f=open">Review</a></li>` : ''}
           ${flagged.length ? `<li><i class="dot red"></i><div class="grow"><b>${flagged.length} item${flagged.length === 1 ? '' : 's'} marked damaged, missing or on the floor</b><div class="muted small">${flagged.slice(0, 6).map(i => '#' + (i.num ?? '?') + ' (tray ' + i.tray + ')').join(', ')}</div></div><a href="#show/${esc(s.id)}/trays">Review</a></li>` : ''}
           ${!s.hasLabels ? `<li><i class="dot amber"></i><div class="grow"><b>No shipping labels yet</b><div class="muted small">Add the labels PDF to print them in tray order.</div></div><a href="#show/${esc(s.id)}/labels">Add</a></li>` : ''}
@@ -371,7 +385,7 @@ async function tabSort(s) {
     const sc = $('#sort-count'); if (sc) sc.textContent = `${nf(c.inTray)} of ${nf(c.items)} scanned`;
     const sb = $('#sort-bar'); if (sb) sb.style.width = pct(c.inTray, c.items) + '%';
     const pc = $('#pack-count'); if (pc) pc.textContent = `${c.packed}/${c.items} packed`;
-    drawGrid(); drawRecent();
+    drawGrid(); drawRecent(); updateSteps(s, 'sort');
   };
   const onScan = (raw, m) => {
     const st = S.cur.st;
@@ -530,12 +544,13 @@ async function tabPack(s, params) {
     el.innerHTML = `<div class="card box-open"><div class="row between wrap"><div class="row"><span class="tray-num xl">${t.n}</span><div><h2>${esc(at(t.buyer))}</h2><p class="muted">${t.packed} of ${t.total} packed${t.boxDone ? ' · <b class="green">Box finished</b>' : ''}</p></div></div>
       <div class="row wrap gap-s">${allIn && !t.boxDone ? '<button class="btn primary" id="finish">Finish box</button>' : ''}${!allIn ? '<button class="btn ghost" id="pack-all">Mark all packed</button>' : ''}<button class="btn ghost" id="close-box">Close box</button></div></div>
       ${allIn && !t.boxDone ? `<p class="hint">${t.tracking?.length ? 'All in — scan the postage label to finish.' : 'All in — tap Finish box (no label on file to scan).'}</p>` : ''}
-      <ul class="checklist">${t.list.map(i => `<li class="${i.status === 'packed' ? 'done' : ''} st-${i.status}"><span class="box-ck"></span><span class="chip num">#${i.num ?? '?'}</span><span class="grow small">${esc(i.title || '')}</span><span class="small muted">${STATUS_LABEL[i.status]}</span></li>`).join('')}</ul></div>`;
+      <ul class="checklist">${t.list.map(i => `<li class="${i.status === 'packed' ? 'done' : ''} st-${i.status}"><span class="box-ck"></span><span class="chip num">#${i.num ?? '?'}</span><span class="grow small">${esc(itemName(i))}</span><span class="small muted">${STATUS_LABEL[i.status]}</span></li>`).join('')}</ul></div>`;
     const fin = $('#finish', el); if (fin) fin.onclick = () => { ev({ ty: 'finish', r: 'ok', tr: t.n, m: 'tap' }); feedback('done', S.settings, `Tray ${t.n} done`); banner('ok', `<span class="label">Box finished</span><span class="tray-num huge">${t.n}</span>`); openN = null; drawBox(); drawList(); };
     const pa = $('#pack-all', el); if (pa) confirmTap(pa, 'Tap again to confirm', () => { t.list.filter(i => i.status !== 'packed' && i.status !== 'cancelled').forEach(i => ev({ ty: 'box', r: 'ok', it: i.id, tr: t.n, m: 'tap' })); drawBox(); drawList(); });
     $('#close-box', el).onclick = () => { openN = null; drawBox(); };
   };
   const drawList = () => {
+    updateSteps(s, 'pack');
     const el = $('#pk-list'); if (!el) return;
     const q = ($('#pk-q')?.value || '').trim().toLowerCase().replace(/^@/, '');
     const trays = [...S.cur.st.trays.values()].sort((a, b) => a.n - b.n).filter(t => (filter === 'done' ? t.boxDone : !t.boxDone) && (!q || String(t.n) === q || t.buyer.toLowerCase().includes(q)));
@@ -654,7 +669,7 @@ async function tabScans(s) {
       <div class="filters"><span class="label">Type</span>${['all', 'tray', 'box', 'label', 'finish', 'handover', 'status', 'undo', 'reset'].map(k => `<button class="chip-btn ${fType === k ? 'on' : ''}" data-ft="${k}">${k === 'all' ? 'All' : TYPE_LABEL[k]}</button>`).join('')}</div>
       <div class="filters"><span class="label">Result</span>${['all', 'ok', 'dup', 'notfound', 'ambiguous', 'wrong', 'verified', 'mismatch', 'incomplete'].map(k => `<button class="chip-btn ${fRes === k ? 'on' : ''}" data-fr="${k}">${k === 'all' ? 'All' : RESULT_LABEL[k]}</button>`).join('')}</div>
       <ul class="log">${list.slice(0, 400).map(e => { const it = e.it ? st.items.get(e.it) : null; return `<li class="${st.undone.has(e.i) ? 'undone' : ''}"><span class="small muted">${fmtTime(e.t)}</span><span class="res r-${e.r || 'ok'}">${RESULT_LABEL[e.r] || (e.ty === 'status' ? STATUS_LABEL[e.s] : 'Done')}</span>
-        <span class="grow">${it ? `<b>#${it.num ?? '?'}</b> ${esc((it.title || '').slice(0, 40))}` : esc(e.c || '')}<div class="muted small">${TYPE_LABEL[e.ty] || e.ty} · ${METHOD_LABEL[e.m] || e.m || ''} · ${esc(e.who || 'This login')}${st.undone.has(e.i) ? ' · undone' : ''}</div></span>${e.tr != null ? `<span class="small">Tray ${e.tr}</span>` : ''}</li>`; }).join('') || '<li class="muted">No scans match.</li>'}</ul>
+        <span class="grow">${it ? `<b>#${it.num ?? '?'}</b> ${esc(itemName(it).slice(0, 40))}` : esc(e.c || '')}<div class="muted small">${TYPE_LABEL[e.ty] || e.ty} · ${METHOD_LABEL[e.m] || e.m || ''} · ${esc(e.who || 'This login')}${st.undone.has(e.i) ? ' · undone' : ''}</div></span>${e.tr != null ? `<span class="small">Tray ${e.tr}</span>` : ''}</li>`; }).join('') || '<li class="muted">No scans match.</li>'}</ul>
       ${list.length > 400 ? `<p class="muted small">Showing the newest 400 of ${list.length}.</p>` : ''}</div>`;
     bindShowHeader(s);
     $$('[data-ft]').forEach(b => { b.onclick = () => { fType = b.dataset.ft; draw(); }; });

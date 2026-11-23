@@ -15,6 +15,21 @@ export function toast(msg, kind = 'info') {
 export function fmtTime(ts) { return ts ? new Date(ts).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' }) : ''; }
 export function fmtDay(ts) { return ts ? new Date(ts).toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' }) : ''; }
 export function fmtDateStr(d) { if (!d) return ''; const [y, m, dd] = d.split('-').map(Number); return new Date(y, m - 1, dd).toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' }); }
+export function fmtDeadline(ts) { return ts ? new Date(ts).toLocaleString(undefined, { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : ''; }
+// "2 days 4 hrs left" / "5 hrs late"
+export function dueIn(ts, now = Date.now()) {
+  if (!ts) return '';
+  const ms = ts - now, a = Math.abs(ms), h = Math.floor(a / 3600000), d = Math.floor(h / 24);
+  const span = d ? `${d} day${d === 1 ? '' : 's'}${h % 24 ? ' ' + (h % 24) + ' hr' + (h % 24 === 1 ? '' : 's') : ''}` : h ? `${h} hr${h === 1 ? '' : 's'}` : `${Math.max(1, Math.round(a / 60000))} min`;
+  return ms >= 0 ? `${span} left` : `${span} late`;
+}
+// Item name without the sticker number repeated in it ("Mystery Squishy #271" -> "Mystery Squishy")
+export function itemName(it) {
+  const t = String(it?.title || '').trim();
+  if (it?.num == null) return t;
+  const c = t.replace(new RegExp('\\s*#\\s*0*' + it.num + '(?!\\d)', 'g'), '').replace(/\s{2,}/g, ' ').trim();
+  return c || t;
+}
 export function fmtWhen(ts) { return ts ? new Date(ts).toLocaleString(undefined, { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) : ''; }
 export function ago(ts) {
   if (!ts) return '—';
