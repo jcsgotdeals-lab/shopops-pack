@@ -96,7 +96,7 @@ export function phoneModal() {
       <ol class="steps-list"><li>Point the phone's camera at this code</li><li>Open the link${who === 'packer' ? ', type their name and tap Join' : ' and sign in'}</li>
       <li>Tap <b>Install app</b> (Android: ⋮ menu → Install app), or use the Android app</li>${who === 'packer' ? '<li>You tap <b>Approve</b> on the Team page. Done.</li>' : ''}</ol>
       ${who === 'packer' ? `<p class="muted small">Or type this team code in the app: <b class="code">${esc(code || '—')}</b></p>` : ''}
-      <p class="small"><a href="https://github.com/jcsgotdeals-lab/shopops-pack/releases/latest/download/ShopOps-Pack.apk">Download the Android app (APK)</a></p>`;
+      <p class="small"><a href="https://github.com/jcsgotdeals-lab/shopops-pack/releases/latest/download/JC-Got-Trays.apk">Download the Android app (APK)</a></p>`;
   };
   $$('.choice', m).forEach(c => { c.onclick = () => draw(c.dataset.who); });
   draw('me');

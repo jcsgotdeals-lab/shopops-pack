@@ -1,4 +1,4 @@
-// ShopOps Pack: start-up, sign-in, menus, and the screens that aren't about one show
+// JC Got Trays: start-up, sign-in, menus, and the screens that aren't about one show
 // (Shows, Import, Pre-show labels, Analytics, Team, Settings, Help).
 import * as db from './db.js';
 import { S, setShowId, prefs, hideRev, stopCamera, openShow } from './ctx.js';
@@ -9,7 +9,7 @@ import { preShowPdf } from './labels.js';
 import { qrSvg } from './qr.js';
 import { viewDash, viewShow, noShow, showReport, phoneModal } from './views-show.js';
 
-const APP_VERSION = '1.2.0';
+const APP_VERSION = '1.3.0';
 const appUrl = () => location.origin + location.pathname;
 const OWNER_NAME = 'JULIAN';
 
@@ -146,7 +146,7 @@ function signInScreen(mode, joinCode, note) {
   document.body.classList.add('signed-out');
   const draw = m => {
     view().innerHTML = `<section class="panel signin">
-      <div class="brand-big"><img src="icons/icon-192.png" alt="" width="56" height="56"><h1>ShopOps <b>Pack</b></h1></div>
+      <div class="brand-big"><img src="icons/icon-192.png" alt="" width="56" height="56"><h1>JC Got <b>Trays</b></h1></div>
       <div class="seg wide"><button data-m="owner" class="${m === 'owner' ? 'on' : ''}">Owner login</button><button data-m="join" class="${m === 'join' ? 'on' : ''}">Join your team</button></div>
       ${note ? `<p class="notice">${note}</p>` : ''}
       ${m === 'owner' ? `
@@ -502,7 +502,7 @@ function viewTeam() {
     <p class="muted small">They scan this with their phone camera, type their name and tap Join. You approve them here.</p>
     <div class="qr-card">${qrSvg(link, 200)}</div>
     <p class="center">Team code <b class="code big">${esc(code)}</b></p>
-    <div class="row wrap center"><button class="btn" id="copy">Copy invite</button><a class="btn" target="_blank" rel="noopener" href="https://wa.me/?text=${encodeURIComponent('Join my packing team on ShopOps Pack: ' + link + '  (team code ' + code + ')')}">Share on WhatsApp</a></div>
+    <div class="row wrap center"><button class="btn" id="copy">Copy invite</button><a class="btn" target="_blank" rel="noopener" href="https://wa.me/?text=${encodeURIComponent('Join my packing team on JC Got Trays: ' + link + '  (team code ' + code + ')')}">Share on WhatsApp</a></div>
     <button class="btn ghost small" id="change">Change code</button>
     <p class="muted small">Changing the code stops new people joining with the old one. People already on the team stay.</p>
   </section></aside></div>`;
@@ -511,7 +511,7 @@ function viewTeam() {
   $$('[data-off]').forEach(b => confirmTap(b, 'Tap again to deactivate', () => db.setMember(b.dataset.off, { status: 'deactivated' })));
   $$('[data-re]').forEach(b => { b.onclick = () => db.setMember(b.dataset.re, { status: 'active' }); });
   $$('[data-rm]').forEach(b => confirmTap(b, 'Tap again to remove', () => db.removeMember(b.dataset.rm)));
-  $('#copy').onclick = async () => { try { await navigator.clipboard.writeText(`Join my packing team on ShopOps Pack: ${link} (team code ${code})`); toast('Invite copied', 'ok'); } catch (e) { toast(link); } };
+  $('#copy').onclick = async () => { try { await navigator.clipboard.writeText(`Join my packing team on JC Got Trays: ${link} (team code ${code})`); toast('Invite copied', 'ok'); } catch (e) { toast(link); } };
   const ch = $('#change'); confirmTap(ch, 'Tap again to make a new code', async () => { await db.changeTeamCode(OWNER_NAME); viewTeam(); });
 }
 
@@ -545,12 +545,12 @@ function viewSettings() {
   </section>
   ${S.owner ? `<section class="panel"><h2>Sign in on your phone</h2><p class="muted small">Scan with your phone camera to open the app, then sign in with your owner login. Packers use the Team page instead.</p>
     <div class="qr-card small-qr">${qrSvg(appUrl(), 150)}</div>
-    <p class="small"><a href="https://github.com/jcsgotdeals-lab/shopops-pack/releases/latest/download/ShopOps-Pack.apk">Download the Android app (APK)</a></p></section>` : ''}
+    <p class="small"><a href="https://github.com/jcsgotdeals-lab/shopops-pack/releases/latest/download/JC-Got-Trays.apk">Download the Android app (APK)</a></p></section>` : ''}
   <section class="panel"><h2>Account</h2>
     <p>${S.owner ? `Signed in as <b>${esc(S.user.email)}</b> (owner)` : `Packing as <b>${esc(S.me?.name || '')}</b> on your team`}</p>
     ${window.__installPrompt ? '<button class="btn" id="install">Install app on this device</button>' : ''}
     <button class="btn ghost" id="signout">Sign out</button>
-    <p class="muted small">ShopOps Pack ${APP_VERSION}</p></section>`;
+    <p class="muted small">JC Got Trays ${APP_VERSION}</p></section>`;
   const saveLocal = () => { db.saveLocalSettings(S.settings); };
   const bindTog = (id, key) => { const el = $('#' + id); if (el) el.onchange = () => { S.settings[key] = el.checked; saveLocal(); toast('Saved', 'ok'); }; };
   bindTog('d-scanner', 'scannerMode'); bindTog('d-sounds', 'sounds'); bindTog('d-voice', 'voice'); bindTog('d-vibrate', 'vibrate');
@@ -590,7 +590,7 @@ function viewHelp() {
     ${q('Adding packers', S.owner ? 'Team → Invite a packer. They scan the QR code, type their name and tap Join; you tap Approve.' : 'Ask the owner for the team code.')}
   </section></div>
   <aside><section class="panel"><h2>Install the app</h2>
-    <p><b>Android phone:</b> <a href="https://github.com/jcsgotdeals-lab/shopops-pack/releases/latest/download/ShopOps-Pack.apk">download the APK</a> and open it (allow "install unknown apps" if asked). Or open this page in Chrome → ⋮ → Install app.</p>
+    <p><b>Android phone:</b> <a href="https://github.com/jcsgotdeals-lab/shopops-pack/releases/latest/download/JC-Got-Trays.apk">download the APK</a> and open it (allow "install unknown apps" if asked). Or open this page in Chrome → ⋮ → Install app.</p>
     <p><b>iPhone:</b> open this page in Safari → Share → Add to Home Screen.</p>
     <p><b>Computer:</b> open this page in Chrome or Edge → the install icon in the address bar.</p>
   </section></aside></div>`;
