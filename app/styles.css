@@ -160,3 +160,10 @@ tr.flag td { background: var(--warn-bg); }
 .toast.ok { background: var(--ok); color: var(--bg); }
 @media (prefers-reduced-motion: no-preference) { .result { transition: background-color .15s; } }
 .scan-input::placeholder { text-transform: none; letter-spacing: 0; font: 400 17px var(--body); }
+
+/* Team sign-in */
+body.signed-out .tabbar, body.signed-out .top-links, body.signed-out .show-pill { display: none; }
+.signin { max-width: 420px; margin: 24px auto; }
+.stack { display: flex; flex-direction: column; gap: 12px; margin: 12px 0; }
+.signin details { margin-top: 16px; }
+.signin summary { cursor: pointer; color: var(--muted); }

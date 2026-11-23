@@ -1,8 +1,8 @@
 // Offline cache: app shell is cached on install; updates take effect on next launch.
-const CACHE = 'shopops-pack-v1';
+const CACHE = 'shopops-pack-v2';
 const FILES = ['./', './index.html', './styles.css', './manifest.webmanifest',
-  './src/app.js', './src/db.js', './src/code128.js', './src/labels.js', './src/importer.js', './src/feedback.js', './src/camera.js',
-  './vendor/pdf-lib.min.js', './vendor/pdf.min.mjs', './vendor/pdf.worker.min.mjs',
+  './src/app.js', './src/db.js', './src/firebase-config.js', './src/code128.js', './src/labels.js', './src/importer.js', './src/feedback.js', './src/camera.js',
+  './vendor/pdf-lib.min.js', './vendor/firebase/firebase-app.js', './vendor/firebase/firebase-firestore.js', './vendor/firebase/firebase-auth.js', './vendor/pdf.min.mjs', './vendor/pdf.worker.min.mjs',
   './icons/icon-192.png', './icons/icon-512.png', './icons/maskable-512.png'];
 self.addEventListener('install', e => { e.waitUntil(caches.open(CACHE).then(c => c.addAll(FILES)).then(() => self.skipWaiting())); });
 self.addEventListener('activate', e => {
