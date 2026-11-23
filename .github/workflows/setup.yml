@@ -1,0 +1,46 @@
+# One-time setup: unpacks the uploaded app files and downloads the two PDF libraries
+# (verified byte-for-byte by checksum). Safe to delete after it has run once.
+name: One-time setup
+on: workflow_dispatch
+permissions:
+  contents: write
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - name: Unpack app files
+        run: |
+          mkdir /tmp/x
+          tar -xJf bootstrap.tar.xz -C /tmp/x
+          rm -rf /tmp/x/.github
+          cp -a /tmp/x/. .
+          git rm -q bootstrap.tar.xz
+      - name: Download PDF libraries and verify checksums
+        run: |
+          set -euo pipefail
+          mkdir -p app/vendor /tmp/p && cd /tmp/p
+          fetch() { # package, first-guess version, file in package, sha256, destination
+            pkg=$1; guess=$2; file=$3; sum=$4; dest=$5
+            for v in $guess $(npm view "$pkg" versions --json | node -e 'let a=JSON.parse(require("fs").readFileSync(0));console.log(a.reverse().join(" "))'); do
+              rm -rf package *.tgz
+              npm pack "$pkg@$v" --silent >/dev/null 2>&1 || continue
+              tar -xzf *.tgz "package/$file" 2>/dev/null || continue
+              if [ "$(sha256sum "package/$file" | cut -d' ' -f1)" = "$sum" ]; then
+                cp "package/$file" "$GITHUB_WORKSPACE/app/vendor/$dest"; echo "$dest = $pkg@$v (checksum OK)"; return 0
+              fi
+            done
+            echo "No matching version of $pkg for $dest"; return 1
+          }
+          fetch pdf-lib 1.17.1 dist/pdf-lib.min.js 0f9a5cad07941f0826586c94e089d89b918c46e5c17cf2d5a3c6f666e3bc694f pdf-lib.min.js
+          fetch pdfjs-dist 6.2.108 build/pdf.min.mjs e0be3863c23c8af2305b16548febd58e7f8874a460253317d7771cddbc1c0f6d pdf.min.mjs
+          fetch pdfjs-dist 6.2.108 build/pdf.worker.min.mjs 0613f41490dd6aaceed7a93fbbd38c85e6d6aa60474b6588c6e7709cfbe18cb3 pdf.worker.min.mjs
+      - name: Save
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Add ShopOps Pack app files"
+          git push
