@@ -1,7 +1,7 @@
 {
-  "name": "ShopOps Pack",
-  "short_name": "Pack",
-  "description": "Pack live-auction orders: numbered stickers, one tray per buyer, scan to tray and scan to box.",
+  "name": "JC Got Trays",
+  "short_name": "JC Got Trays",
+  "description": "Pack live-auction orders: numbered stickers, one tray per package, scan to tray and scan to box.",
   "id": "./",
   "start_url": "./#trays",
   "scope": "./",
