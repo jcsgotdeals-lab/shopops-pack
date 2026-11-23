@@ -1,6 +1,6 @@
 {
   "appId": "com.shopops.pack",
-  "appName": "ShopOps Pack",
+  "appName": "JC Got Trays",
   "webDir": "app",
   "android": { "allowMixedContent": false }
 }

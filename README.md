@@ -1,4 +1,4 @@
-# ShopOps Pack
+# JC Got Trays
 
 Packing app for TikTok Shop LIVE auctions. Every sold item gets a numbered sticker. After the show, each buyer gets a numbered tray, and you pack trays by scanning. Runs on Android phones and on any computer (Mac, Windows, Chromebook) from the same code. All devices signed in to the team login share the same data, live.
 
@@ -31,7 +31,7 @@ Packing app for TikTok Shop LIVE auctions. Every sold item gets a numbered stick
 
 ### Option B: Android APK
 
-The "Build Android APK" workflow builds the APK on GitHub on every push. Open **Actions → Build Android APK → latest run → Artifacts**, download `ShopOps-Pack-apk`, copy the APK to the phone and open it. Android will ask you to allow installing from this source. Push a tag such as `v1.0.0` to also get the APK on the Releases page.
+The "Build Android APK" workflow builds the APK on GitHub on every push. Open **Actions → Build Android APK → latest run → Artifacts**, download `JC-Got-Trays-apk`, copy the APK to the phone and open it. Android will ask you to allow installing from this source. Push a tag such as `v1.0.0` to also get the APK on the Releases page.
 
 The APK is unsigned for store use (debug build). That's fine for your own phones. Publishing to the Play Store needs a signing key.
 
