@@ -1,0 +1,32 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function isOwner() { return signedIn() && request.auth.token.email == 'jcsgotdeals@gmail.com'; }
+    function isMember() {
+      return signedIn() && exists(/databases/$(database)/documents/members/$(request.auth.uid))
+        && get(/databases/$(database)/documents/members/$(request.auth.uid)).data.status == 'active';
+    }
+    function onTeam() { return isOwner() || isMember(); }
+
+    match /team/{id} { allow read, write: if isOwner(); }
+    match /members/{uid} {
+      allow read: if isOwner() || (signedIn() && request.auth.uid == uid);
+      allow create: if signedIn() && request.auth.uid == uid
+        && request.resource.data.status == 'pending'
+        && request.resource.data.code == get(/databases/$(database)/documents/team/main).data.code;
+      allow delete: if isOwner() || (signedIn() && request.auth.uid == uid && resource.data.status == 'pending');
+      allow update: if isOwner();
+    }
+    match /shows/{id} {
+      allow read: if onTeam();
+      allow create, delete: if isOwner();
+      allow update: if isOwner() || (isMember() && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['sum']));
+    }
+    match /showData/{id} { allow read: if onTeam(); allow write: if isOwner(); }
+    match /files/{id} { allow read: if onTeam(); allow write: if isOwner(); }
+    match /fileChunks/{id} { allow read: if onTeam(); allow write: if isOwner(); }
+    match /prefs/{id} { allow read: if onTeam(); allow write: if isOwner(); }
+    match /events/{id} { allow read, create, update: if onTeam(); allow delete: if isOwner(); }
+  }
+}
