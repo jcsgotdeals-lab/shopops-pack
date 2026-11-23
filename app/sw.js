@@ -1,5 +1,5 @@
 // Offline cache: app shell is cached on install; updates take effect on next launch.
-const CACHE = 'jcgottrays-v4';
+const CACHE = 'jcgottrays-v5';
 const FILES = ['./', './index.html', './styles.css', './manifest.webmanifest',
   './src/app.js', './src/views-show.js', './src/ctx.js', './src/ui.js', './src/state.js', './src/qr.js', './src/db.js', './src/firebase-config.js', './src/code128.js', './src/labels.js', './src/importer.js', './src/feedback.js', './src/camera.js',
   './vendor/pdf-lib.min.js', './vendor/firebase/firebase-app.js', './vendor/firebase/firebase-firestore.js', './vendor/firebase/firebase-auth.js', './vendor/pdf.min.mjs', './vendor/pdf.worker.min.mjs',

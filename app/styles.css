@@ -390,3 +390,13 @@ body.packer .owner-only { display: none !important; }
   .show-title .split { width: 100%; } .show-title .split .btn:first-child { flex: 1; }
 }
 .step b { white-space: nowrap; }
+/* v1.4 polish */
+.show-title .late { color: var(--red, #d33); font-weight: 600; }
+.show-title .soon { color: var(--amber, #c77c00); font-weight: 600; }
+@media (max-width: 860px) {
+  /* While scanning on a phone, keep the scan box near the top */
+  .show-title.working { margin: 6px 0 0; }
+  .show-title.working h1, .show-title.working .split, .show-title.working .meta { display: none; }
+}
+.due-card { display: flex; align-items: center; gap: 12px; }
+.due-card.late { border-color: var(--red, #d33); }
