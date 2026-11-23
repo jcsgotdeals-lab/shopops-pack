@@ -691,6 +691,12 @@ async function viewSettings() {
       <button class="btn" id="backup">Download backup</button>
       <label class="btn ghost file-btn">Restore backup<input id="restore" type="file" accept=".json,application/json"></label>
     </div>
+    <p class="muted small">Restoring adds the backup's shows to the team data. It never deletes anything.</p>
+  </section>
+  <section class="panel">
+    <h2>Team login</h2>
+    <p class="muted">Signed in as <b>${esc(db.currentUser()?.email || '')}</b>. Everything syncs live to every device signed in to this login.</p>
+    <button class="btn ghost" id="signout">Sign out of this device</button>
   </section>
   <section class="panel">
     <h2>Install</h2>
@@ -723,16 +729,31 @@ async function viewSettings() {
     try {
       await db.importBackup(JSON.parse(await readText(f)));
       state.settings = await db.getSettings();
-      setShow(null); await updateShowLabel();
-      toast('Backup restored', 'ok'); location.hash = '#shows';
+      await updateShowLabel();
+      toast('Backup added to the team data', 'ok'); location.hash = '#shows';
     } catch (err) { toast(err.message, 'error'); }
   };
+  $('#signout').onclick = () => db.signOut();
   const ib = $('#install-btn');
   if (ib) ib.onclick = async () => { const p = window.__installPrompt; if (!p) return; p.prompt(); await p.userChoice; window.__installPrompt = null; ib.hidden = true; };
 }
 
 // ---------- Router ----------
 const routes = { shows: viewShows, stickers: viewStickers, import: viewImport, trays: viewTrays, scan: viewScan, pack: viewPack, history: viewHistory, settings: viewSettings };
+const routeName = () => (location.hash.slice(1) || (state.showId ? 'trays' : 'shows')).split('?')[0];
+// When another phone or computer changes something, redraw screens that just display data.
+// Scan, Pack and Import are left alone so a scan in progress is never interrupted.
+const LIVE_VIEWS = ['shows', 'stickers', 'trays', 'history'];
+async function liveRefresh() {
+  await updateShowLabel();
+  const name = routeName();
+  if (!LIVE_VIEWS.includes(name)) return;
+  const a = document.activeElement;
+  if (a && view().contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName)) return; // someone is typing
+  const y = window.scrollY;
+  const [, qs] = (location.hash.slice(1) || name).split('?');
+  try { await routes[name](new URLSearchParams(qs || '')); window.scrollTo(0, y); } catch (err) { console.error(err); }
+}
 async function route() {
   stopCamera();
   view().onclick = null;
@@ -744,7 +765,55 @@ async function route() {
   window.scrollTo(0, 0);
 }
 
+// ---------- Team sign-in ----------
+function viewSignIn() {
+  document.body.classList.add('signed-out');
+  view().innerHTML = `
+  <section class="panel signin">
+    <h1>Sign in</h1>
+    <p class="muted">Use your team's ShopOps Pack login. Every phone and computer signed in to it sees the same shows, trays and scans, live.</p>
+    <form id="signin-form" class="stack">
+      <label>Email<input id="si-email" type="email" autocomplete="username" required></label>
+      <label>Password<input id="si-pass" type="password" autocomplete="current-password" required minlength="6"></label>
+      <button class="btn primary" id="si-go">Sign in</button>
+    </form>
+    <p class="muted small" id="si-msg"></p>
+    <details class="small"><summary>First time setting up your team?</summary>
+      <p class="muted">Create the team login once, then sign in with it on every device.</p>
+      <button class="btn" id="si-create" type="button">Create team login</button>
+    </details>
+  </section>`;
+  const msg = t => { $('#si-msg').textContent = t; };
+  const friendly = err => ({
+    'auth/invalid-credential': 'Wrong email or password.', 'auth/wrong-password': 'Wrong email or password.',
+    'auth/user-not-found': 'Wrong email or password.', 'auth/invalid-email': 'That email address doesn\'t look right.',
+    'auth/email-already-in-use': 'A team login with that email already exists. Sign in instead.',
+    'auth/weak-password': 'Use a password with at least 6 characters.', 'auth/network-request-failed': 'No internet connection. Connect and try again.',
+    'auth/operation-not-allowed': 'New team logins are turned off. Sign in with your existing team login.',
+    'auth/admin-restricted-operation': 'New team logins are turned off. Sign in with your existing team login.',
+  }[err.code] || err.message);
+  $('#signin-form').onsubmit = async e => {
+    e.preventDefault(); msg('Signing in…');
+    try { await db.signIn($('#si-email').value, $('#si-pass').value); location.reload(); } catch (err) { msg(friendly(err)); }
+  };
+  $('#si-create').onclick = async () => {
+    if (!$('#signin-form').reportValidity()) return;
+    msg('Creating team login…');
+    try { await db.createTeam($('#si-email').value, $('#si-pass').value); location.reload(); } catch (err) { msg(friendly(err)); }
+  };
+}
+
 async function boot() {
+  if ('serviceWorker' in navigator && location.protocol !== 'file:') navigator.serviceWorker.register('./sw.js').catch(() => {});
+  const user = await db.waitForUser();
+  if (!user) { viewSignIn(); return; }
+  await db.start();
+  db.onRemoteChange(liveRefresh);
+  let lastErr = 0;
+  db.onError(err => {
+    if (Date.now() - lastErr < 10000) return; lastErr = Date.now();
+    toast(err && err.code === 'permission-denied' ? 'This login no longer has access to the team data. Sign out and sign in again.' : 'Sync problem: ' + (err.message || err), 'error');
+  });
   state.settings = await db.getSettings();
   let saved = null; try { saved = localStorage.getItem('currentShow'); } catch (e) { /* ignore */ }
   if (saved && await db.get('shows', saved)) state.showId = saved;
@@ -752,6 +821,5 @@ async function boot() {
   window.addEventListener('hashchange', route);
   window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); window.__installPrompt = e; });
   route();
-  if ('serviceWorker' in navigator && location.protocol !== 'file:') navigator.serviceWorker.register('./sw.js').catch(() => {});
 }
 boot();
