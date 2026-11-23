@@ -1,5 +1,5 @@
 // Reads TikTok Shop PDFs (shipping labels + packing slips) and order CSVs.
-import { stickerCode } from './labels.js';
+import { stickerCode, nameKey } from './state.js';
 
 let pdfjsP;
 async function pdfjs() {
@@ -86,115 +86,100 @@ export function buyerKey(name) {
 
 function esc(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
-// Find sticker codes referenced in text, given the show's batches.
-export function findStickerCodes(text, batches, settings = {}) {
-  const codes = [];
-  const add = c => { if (!codes.includes(c)) codes.push(c); };
-  for (const b of batches) {
-    const inRange = n => n >= b.start && n < b.start + b.count;
-    for (const m of text.matchAll(new RegExp(`\\b${esc(b.prefix)}\\s*-?\\s*(\\d{1,6})\\b`, 'gi'))) {
-      const n = +m[1]; if (inRange(n)) add(stickerCode(b, n));
+// ---- items on a packing slip ----
+// TikTok item titles end in the sticker number, e.g. "(F) SQUISHIES(Non-Branded) Buy 1 Rest Ship FREE! #67".
+// Titles can wrap onto a second line, so a short piece before "#67" takes the line above as well.
+const NOT_ITEM = /\b(order|tracking|invoice|page|package|po box|apt|suite|unit|ste)\b\s*$/i;
+const HEADER = /(product\s*name|item\s*name|\bsku\b|\bqty\b|quantity|order\s*id|buyer|ship\s*to|packing\s*(slip|list)|:)/i;
+export function findItems(text) {
+  const lines = text.split('\n');
+  const out = [];
+  lines.forEach((line, li) => {
+    for (const m of line.matchAll(/#\s?(\d{1,5})(?![\d])/g)) {
+      let before = line.slice(0, m.index).replace(/^.*#\s?\d{1,5}\s*/, '').trim();
+      if (NOT_ITEM.test(before)) continue;
+      if (before.length < 15 && li > 0 && !/#\s?\d/.test(lines[li - 1]) && !HEADER.test(lines[li - 1])) before = (lines[li - 1].trim() + ' ' + before).trim();
+      before = before.replace(/^(?:\d+[.)]?\s+)+/, '').replace(/^(?:product\s*name|item\s*name)\s*/i, '').trim();
+      if (before.length > 120) before = before.slice(-120);
+      const num = +m[1];
+      const after = (line.slice(m.index + m[0].length) + ' ' + (lines[li + 1] || '')).slice(0, 80);
+      const q = after.match(/\b(?:qty|quantity|x)\s*[:x]?\s*(\d{1,3})\b/i);
+      const price = after.match(/\$\s?(\d{1,5}(?:\.\d{2})?)/);
+      out.push({ title: (before + ' #' + num).trim(), name: before, num, qty: q ? +q[1] : 1, price: price ? +price[1] : 0 });
     }
-    if (b.name) {
-      for (const m of text.matchAll(new RegExp(`${esc(b.name)}\\s*(?:#|no\\.?|number|num|lot|-|:|x)?\\s*#?(\\d{1,6})\\b`, 'gi'))) {
-        const n = +m[1]; if (inRange(n)) add(stickerCode(b, n));
-      }
-    }
-  }
-  if (settings.stickerRegex && batches.length) {
-    try {
-      for (const m of text.matchAll(new RegExp(settings.stickerRegex, 'gi'))) {
-        const n = +(m[1] || m[0]).replace(/\D/g, '');
-        const b = batches.find(b => n >= b.start && n < b.start + b.count);
-        if (b) add(stickerCode(b, n));
-      }
-    } catch (e) { /* invalid user regex is reported in settings */ }
-  }
-  return codes;
+  });
+  const seen = new Set();
+  return out.filter(i => { const k = nameKey(i.name) + '#' + i.num; if (seen.has(k)) return false; seen.add(k); return true; });
 }
 
-function findQty(lines) {
-  let total = 0;
-  for (const l of lines) {
-    const m = l.match(/\b(?:qty|quantity)\s*[:x]?\s*(\d{1,3})\b/i);
-    if (m) total += +m[1];
-  }
-  return total || null;
+// Tracking numbers on a shipping label (USPS 9xxx…, UPS 1Z…, FedEx 12/15/20 digits)
+export function findTracking(text) {
+  const out = new Set();
+  const squashed = text.replace(/(\d)\s+(?=\d)/g, '$1');
+  for (const m of squashed.matchAll(/\b(9[1-5]\d{18,24})\b/g)) out.add(m[1]);
+  for (const m of squashed.matchAll(/\b(1Z[0-9A-Z]{16})\b/gi)) out.add(m[1].toUpperCase());
+  if (!out.size) for (const m of squashed.matchAll(/(?:tracking|trk)\s*(?:#|no\.?|number)?\s*[:#]?\s*([0-9A-Z]{10,34})/gi)) out.add(m[1].toUpperCase());
+  return [...out];
 }
 
-// Parse one or more PDFs. files: [{id, name, bytes}]
-export async function parsePdfs(files, batches, settings, onProgress) {
+// Parse one or more PDFs (combined labels + packing slips, or slips only). files: [{id, name, bytes}]
+export async function parsePdfs(files, onProgress) {
   const orders = new Map();
-  const labels = []; // {fileId, pageIndex, orderIds, seq}
-  const seq = []; // overall page sequence for adjacency pairing
+  const labels = [];
+  const seq = [];
   for (const f of files) {
     const pages = await extractPages(f.bytes);
     for (const p of pages) {
       onProgress && onProgress(`${f.name}: page ${p.pageIndex + 1} of ${pages.length}`);
       const kind = classifyPage(p.text);
       const ids = findOrderIds(p.text);
-      const entry = { fileId: f.id, pageIndex: p.pageIndex, kind, ids, text: p.text };
+      const entry = { fileId: f.id, pageIndex: p.pageIndex, kind, ids, tracking: kind === 'slip' ? [] : findTracking(p.text) };
       seq.push(entry);
       if (kind === 'slip') {
         const oid = ids[0] || `slip-${f.id}-${p.pageIndex}`;
         let o = orders.get(oid);
-        if (!o) {
-          o = { orderId: oid, extraOrderIds: ids.slice(1), buyer: '', codes: [], qty: null, slipPages: [], labelPages: [], text: '', firstSeq: seq.length };
-          orders.set(oid, o);
-        }
+        if (!o) { o = { orderId: oid, extraOrderIds: ids.slice(1), buyer: '', items: [], slipPages: [], labelPages: [], tracking: [], firstSeq: seq.length }; orders.set(oid, o); }
         o.buyer = o.buyer || findBuyer(p.lines);
-        o.text += '\n' + p.text;
-        findStickerCodes(p.text, batches, settings).forEach(c => { if (!o.codes.includes(c)) o.codes.push(c); });
-        const q = findQty(p.lines); if (q) o.qty = (o.qty || 0) + q;
+        for (const it of findItems(p.text)) if (!o.items.some(x => x.num === it.num && nameKey(x.name) === nameKey(it.name))) o.items.push(it);
         o.slipPages.push({ fileId: f.id, pageIndex: p.pageIndex });
         entry.order = o;
-      } else {
-        labels.push(entry);
-      }
+      } else labels.push(entry);
     }
   }
-  // Pair labels to orders: 1) by order ID in label text
-  const unmatched = [];
   const byAnyId = new Map();
   for (const o of orders.values()) { byAnyId.set(o.orderId, o); o.extraOrderIds.forEach(id => byAnyId.set(id, o)); }
-  for (const l of labels) {
-    const o = l.ids.map(id => byAnyId.get(id)).find(Boolean);
-    if (o) { o.labelPages.push({ fileId: l.fileId, pageIndex: l.pageIndex }); l.done = true; }
-  }
-  // 2) by position: label directly before its slip, then directly after
+  const attach = (o, l) => { o.labelPages.push({ fileId: l.fileId, pageIndex: l.pageIndex }); l.tracking.forEach(t => { if (!o.tracking.includes(t)) o.tracking.push(t); }); l.done = true; };
+  for (const l of labels) { const o = l.ids.map(id => byAnyId.get(id)).find(Boolean); if (o) attach(o, l); }
   for (const dir of [1, -1]) {
     for (let i = 0; i < seq.length; i++) {
       const l = seq[i];
       if (l.kind === 'slip' || l.done) continue;
       const n = seq[i + dir];
-      if (n && n.kind === 'slip' && n.fileId === l.fileId && n.order && !n.order.labelPages.length) {
-        n.order.labelPages.push({ fileId: l.fileId, pageIndex: l.pageIndex });
-        l.done = true;
-      }
+      if (n && n.kind === 'slip' && n.fileId === l.fileId && n.order && !n.order.labelPages.length) attach(n.order, l);
     }
   }
-  for (const l of labels) if (!l.done) unmatched.push({ fileId: l.fileId, pageIndex: l.pageIndex, kind: l.kind });
+  const unmatched = labels.filter(l => !l.done).map(l => ({ fileId: l.fileId, pageIndex: l.pageIndex }));
   const list = [...orders.values()].sort((a, b) => a.firstSeq - b.firstSeq);
-  list.forEach(o => { o.buyerKey = buyerKey(o.buyer) || 'order' + o.orderId; delete o.text; });
-  return { orders: list, unmatchedLabels: unmatched, pageCount: seq.length };
+  list.forEach(o => { o.buyerKey = buyerKey(o.buyer) || 'order' + o.orderId; });
+  return { orders: list, unmatchedLabels: unmatched, pageCount: seq.length, labelPages: labels.length };
 }
 
-// Labels-only PDF uploaded after slips were imported: match by order ID, else by order of appearance.
-export async function parseLabelsOnly(file, existingOrders) {
+// A shipping-labels PDF added after a slips-only import: match by order ID, else by position.
+export async function parseLabelsOnly(file, orders) {
   const pages = await extractPages(file.bytes);
   const byId = new Map();
-  existingOrders.forEach(o => { byId.set(o.orderId, o); (o.extraOrderIds || []).forEach(id => byId.set(id, o)); });
+  orders.forEach(o => { byId.set(o.orderId, o); (o.extraOrderIds || []).forEach(id => byId.set(id, o)); });
   const assignments = []; const leftovers = [];
   for (const p of pages) {
     const o = findOrderIds(p.text).map(id => byId.get(id)).find(Boolean);
-    if (o) assignments.push({ order: o, ref: { fileId: file.id, pageIndex: p.pageIndex } });
+    if (o) assignments.push({ order: o, ref: { fileId: file.id, pageIndex: p.pageIndex }, tracking: findTracking(p.text) });
     else leftovers.push(p.pageIndex);
   }
   let positional = false;
-  if (!assignments.length && pages.length === existingOrders.length) {
+  if (!assignments.length && pages.length === orders.length) {
     positional = true;
-    const sorted = existingOrders.slice().sort((a, b) => (a.firstSeq || 0) - (b.firstSeq || 0));
-    pages.forEach((p, i) => assignments.push({ order: sorted[i], ref: { fileId: file.id, pageIndex: p.pageIndex } }));
+    const sorted = orders.slice().sort((a, b) => (a.firstSeq || 0) - (b.firstSeq || 0));
+    pages.forEach((p, i) => assignments.push({ order: sorted[i], ref: { fileId: file.id, pageIndex: p.pageIndex }, tracking: findTracking(p.text) }));
     leftovers.length = 0;
   }
   return { assignments, leftovers, positional, pageCount: pages.length };
@@ -222,7 +207,7 @@ export function parseCsv(text) {
   return rows;
 }
 
-export function ordersFromCsv(text, batches, settings) {
+export function ordersFromCsv(text) {
   const rows = parseCsv(text);
   if (rows.length < 2) throw new Error('The CSV has no order rows.');
   const head = rows[0].map(h => h.trim().toLowerCase());
@@ -230,49 +215,54 @@ export function ordersFromCsv(text, batches, settings) {
   const cOrder = col(/^order\s*id$/, /order\s*(id|no|number)/);
   const cBuyer = col(/buyer\s*username/, /buyer\s*nickname/, /^buyer/, /recipient/, /customer/, /ship.*name/);
   const cQty = col(/^quantity$/, /qty|quantity/);
+  const cTitle = col(/product\s*name/, /item\s*name/, /title/, /listing/);
+  const cTrack = col(/tracking/);
   if (cOrder < 0) throw new Error('Could not find an "Order ID" column in the CSV.');
   const orders = new Map();
   rows.slice(1).forEach((r, idx) => {
-    // skip TikTok's description row under the header
     if (!/\d{6,}/.test(r[cOrder] || '')) return;
     const oid = (r[cOrder] || '').trim();
-    const buyer = cBuyer >= 0 ? (r[cBuyer] || '').trim() : '';
     let o = orders.get(oid);
-    if (!o) { o = { orderId: oid, extraOrderIds: [], buyer, codes: [], qty: 0, slipPages: [], labelPages: [], firstSeq: idx }; orders.set(oid, o); }
-    o.buyer = o.buyer || buyer;
-    findStickerCodes(r.join(' | '), batches, settings).forEach(c => { if (!o.codes.includes(c)) o.codes.push(c); });
-    o.qty += cQty >= 0 ? (parseInt(r[cQty], 10) || 1) : 1;
+    if (!o) { o = { orderId: oid, extraOrderIds: [], buyer: cBuyer >= 0 ? (r[cBuyer] || '').trim() : '', items: [], slipPages: [], labelPages: [], tracking: [], firstSeq: idx }; orders.set(oid, o); }
+    const found = findItems(cTitle >= 0 ? r[cTitle] || '' : r.join(' | '));
+    found.forEach(it => { it.qty = cQty >= 0 ? (parseInt(r[cQty], 10) || 1) : 1; o.items.push(it); });
+    if (cTrack >= 0 && r[cTrack]) o.tracking.push(r[cTrack].trim());
   });
   const list = [...orders.values()];
   list.forEach(o => { o.buyerKey = buyerKey(o.buyer) || 'order' + o.orderId; });
-  return { orders: list, unmatchedLabels: [], pageCount: 0 };
+  return { orders: list, unmatchedLabels: [], pageCount: 0, labelPages: 0 };
 }
 
-// Group parsed orders into trays. Earliest sticker number = earliest win = lowest tray number.
-export function planTrays(parsedOrders, batches, existingTrays = []) {
-  const batchRank = new Map(batches.map((b, i) => [b.prefix, i]));
-  const codeRank = code => {
-    const b = batches.find(b => code.startsWith(b.prefix));
-    const n = b ? parseInt(code.slice(b.prefix.length), 10) : 1e9;
-    return (b ? batchRank.get(b.prefix) : 999) * 1e7 + n;
-  };
+// Build trays the Scan2Tray "post-show" way: the buyer with the most items gets Tray 1, and so on.
+// A tray holds at most `perTray` items; bigger buyers get extra trays, placed by their size.
+export function planShow(orders, perTray = 24) {
   const groups = new Map();
-  for (const o of parsedOrders) {
+  for (const o of orders) {
     let g = groups.get(o.buyerKey);
-    if (!g) { g = { buyerKey: o.buyerKey, buyer: o.buyer || 'Unknown buyer', orders: [], codes: [], rank: Infinity, seq: Infinity }; groups.set(o.buyerKey, g); }
+    if (!g) { g = { buyerKey: o.buyerKey, buyer: o.buyer || 'Unknown buyer', orders: [], items: [], seq: o.firstSeq ?? 0 }; groups.set(o.buyerKey, g); }
     g.orders.push(o);
-    o.codes.forEach(c => { if (!g.codes.includes(c)) g.codes.push(c); });
-    g.rank = Math.min(g.rank, ...o.codes.map(codeRank));
-    g.seq = Math.min(g.seq, o.firstSeq ?? 0);
+    for (const it of o.items) for (let q = 0; q < Math.max(1, it.qty || 1); q++) g.items.push({ ...it, orderId: o.orderId });
+    if (!o.items.length) g.items.push({ title: 'Item without a sticker number', name: '', num: null, qty: 1, price: 0, orderId: o.orderId, noNum: true });
   }
-  const existingByKey = new Map(existingTrays.map(t => [t.buyerKey, t]));
-  let next = existingTrays.reduce((m, t) => Math.max(m, t.number), 0) + 1;
-  const sorted = [...groups.values()].sort((a, b) => a.rank - b.rank || a.seq - b.seq);
-  sorted.forEach(g => {
-    g.codes.sort((a, b) => codeRank(a) - codeRank(b));
-    const ex = existingByKey.get(g.buyerKey);
-    g.number = ex ? ex.number : next++;
-    g.existing = !!ex;
+  const chunks = [];
+  for (const g of groups.values()) {
+    g.items.sort((a, b) => (a.num ?? 1e9) - (b.num ?? 1e9));
+    for (let i = 0; i < g.items.length; i += perTray) chunks.push({ g, items: g.items.slice(i, i + perTray), part: i / perTray });
+  }
+  chunks.sort((a, b) => b.items.length - a.items.length || a.g.seq - b.g.seq || a.part - b.part);
+  const trays = [], items = [];
+  chunks.forEach((c, i) => {
+    const n = i + 1;
+    const orderIds = [...new Set(c.items.map(x => x.orderId))];
+    const tracking = [...new Set(c.g.orders.filter(o => orderIds.includes(o.orderId)).flatMap(o => o.tracking || []))];
+    const t = { n, buyer: c.g.buyer, buyerKey: c.g.buyerKey, orderIds, items: [], tracking, part: c.part };
+    c.items.forEach((x, j) => {
+      const id = `${n}-${j}`;
+      items.push({ id, num: x.num, name: x.name, code: x.num != null ? stickerCode(x.name, x.num) : '', title: x.title, price: x.price || 0, tray: n, orderId: x.orderId, noNum: !!x.noNum });
+      t.items.push(id);
+    });
+    trays.push(t);
   });
-  return sorted.sort((a, b) => a.number - b.number);
+  const slim = orders.map(o => ({ orderId: o.orderId, extraOrderIds: o.extraOrderIds, buyer: o.buyer, buyerKey: o.buyerKey, slipPages: o.slipPages, labelPages: o.labelPages, tracking: o.tracking, firstSeq: o.firstSeq }));
+  return { trays, items, orders: slim };
 }

@@ -1,825 +1,603 @@
+// ShopOps Pack: start-up, sign-in, menus, and the screens that aren't about one show
+// (Shows, Import, Pre-show labels, Analytics, Team, Settings, Help).
 import * as db from './db.js';
-import { stickerBatchPdf, trayLabelsPdf, reorderedLabelsPdf, reorderedSlipsPdf, stickerCode } from './labels.js';
-import { parsePdfs, parseLabelsOnly, ordersFromCsv, planTrays, buyerKey } from './importer.js';
-import { drawToCanvas } from './code128.js';
-import { feedback } from './feedback.js';
-import { CameraScanner } from './camera.js';
+import { S, setShowId, prefs, hideRev, stopCamera, openShow } from './ctx.js';
+import { counts, pct, pctFloor, buildState, METHOD_LABEL, nameKey } from './state.js';
+import { $, $$, esc, view, at, toast, fmtDateStr, fmtWhen, ago, dur, money, nf, modal, confirmTap, saveFile, printPdf, readFile, readText, isPhone } from './ui.js';
+import { parsePdfs, ordersFromCsv, planShow } from './importer.js';
+import { preShowPdf } from './labels.js';
+import { qrSvg } from './qr.js';
+import { viewDash, viewShow, noShow, showReport, phoneModal } from './views-show.js';
 
-const $ = (s, el = document) => el.querySelector(s);
-const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-const view = () => $('#view');
+const APP_VERSION = '1.2.0';
+const appUrl = () => location.origin + location.pathname;
+const OWNER_NAME = 'JULIAN';
 
-const state = {
-  settings: null,
-  showId: null,
-  pendingImport: null,
-  camera: null,
-  packTray: null,
+// ================= start-up =================
+async function boot() {
+  if ('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('./sw.js').catch(() => {});
+  window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); window.__installPrompt = e; });
+  db.start();
+  let lastErr = 0;
+  db.onError(err => {
+    if (Date.now() - lastErr < 10000) return; lastErr = Date.now();
+    if (err && err.code === 'permission-denied') toast(S.owner ? 'The team database refused a change. Sign out and in again.' : 'This phone no longer has access to the team. Ask the owner to reactivate you.', 'error');
+    else toast('Sync problem: ' + (err.message || err), 'error');
+  });
+  const params = new URLSearchParams(location.search);
+  const joinCode = params.get('join');
+  const user = await db.waitForUser();
+  if (!user) return signInScreen(joinCode ? 'join' : 'owner', joinCode);
+  S.user = user;
+  if (db.isOwnerUser(user)) {
+    S.owner = true;
+    await db.startTeamData(true);
+    db.ensureTeam(OWNER_NAME).catch(() => {});
+    const name = S.settings.deviceName.trim();
+    db.setDevice({ id: db.deviceId(), who: name || 'You', whoKind: name ? 'phone' : 'owner' });
+    startApp();
+  } else if (user.isAnonymous) {
+    let started = false;
+    db.watchMe((me, err) => {
+      if (err) { console.error(err); return joinScreen(joinCode, "Couldn't reach your team. Check the internet and try again."); }
+      S.me = me;
+      if (!me) return started ? location.reload() : joinScreen(joinCode);
+      if (me.status === 'pending') return waitingScreen(me);
+      if (me.status === 'deactivated') return blockedScreen(me);
+      if (me.status === 'active' && !started) {
+        started = true;
+        db.setDevice({ id: db.deviceId(), who: me.name, whoKind: 'packer' });
+        db.startTeamData(false).then(startApp);
+      }
+    });
+  } else {
+    signInScreen('owner', null, `${esc(user.email)} isn't the owner login for this team. Packers join with the team code instead.`);
+    db.signOut().catch(() => {});
+  }
+}
+
+function startApp() {
+  document.body.classList.remove('signed-out');
+  document.body.classList.toggle('packer', !S.owner);
+  buildShell();
+  let saved = null; try { saved = localStorage.getItem('currentShow'); } catch (e) { /* ignore */ }
+  if (saved && db.getShow(saved)) S.showId = saved;
+  else { const latest = db.shows().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))[0]; if (latest) S.showId = latest.id; }
+  if (location.search.includes('join=')) history.replaceState(null, '', location.pathname + location.hash);
+  db.onChange(onData);
+  window.addEventListener('hashchange', route);
+  route();
+}
+
+// Something changed on another phone or computer
+async function onData(keys) {
+  if (S.showId && !db.getShow(S.showId)) { setShowId(null); if (S.cur) S.cur = null; return route(); }
+  const name = location.hash.slice(1).split('?')[0] || '';
+  if (keys.has('shows') && S.cur && db.getShow(S.cur.id) && db.getShow(S.cur.id).dataVersion !== S.cur.version) {
+    await openShow(S.cur.id); return route();
+  }
+  if (S.cur && keys.has('events:' + S.cur.id) && S.refresh) S.refresh();
+  if ((keys.has('shows') || keys.has('prefs')) && ['', 'shows', 'analytics'].includes(name)) route();
+  if ((keys.has('members') || keys.has('team')) && name === 'team') route();
+  if (keys.has('prefs') && S.refresh) S.refresh();
+}
+
+// ================= menus =================
+const OWNER_NAV = [['shows', 'Shows'], ['labels', 'Pre-Show Labels'], ['analytics', 'Analytics'], ['team', 'Team'], ['settings', 'Settings'], ['help', 'Help']];
+const PACKER_NAV = [['dash', 'Dashboard'], ['tray-scan', 'Scan to Tray'], ['trays', 'Trays'], ['box-scan', 'Scan to Box'], ['settings', 'Settings'], ['help', 'Help']];
+const ICON = {
+  dash: '<path d="M4 13h6V4H4zM14 20h6v-9h-6zM4 20h6v-4H4zM14 4v4h6V4z"/>',
+  'tray-scan': '<path d="M3 8V4h4M17 4h4v4M21 16v4h-4M7 20H3v-4M7 9v6M10 9v6M13 9v6M16 9v6"/>',
+  trays: '<path d="M3 4h7v7H3zM14 4h7v7h-7zM3 14h7v7H3zM14 14h7v7h-7z"/>',
+  'box-scan': '<path d="M3 8l9-4 9 4v9l-9 4-9-4zM3 8l9 4 9-4M12 12v9"/>',
+  settings: '<path d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>',
 };
-
-// ---------- helpers ----------
-function toast(msg, kind = 'info') {
-  const t = document.createElement('div');
-  t.className = 'toast ' + kind;
-  t.textContent = msg;
-  $('#toasts').appendChild(t);
-  setTimeout(() => t.remove(), 3800);
+function buildShell() {
+  const nav = S.owner ? OWNER_NAV : PACKER_NAV;
+  $('#top-nav').innerHTML = nav.map(([k, l]) => `<a href="#${k}" data-nav="${k}">${l}</a>`).join('');
+  $('#tabbar').innerHTML = ['dash', 'tray-scan', 'trays', 'box-scan', 'settings'].map(k => `<a href="#${k}" data-nav="${k}"><svg viewBox="0 0 24 24">${ICON[k]}</svg><span>${{ dash: 'Dashboard', 'tray-scan': 'Scan to Tray', trays: 'Trays', 'box-scan': 'Scan to Box', settings: 'Settings' }[k]}</span></a>`).join('');
+  $('#who').textContent = S.owner ? (S.settings.deviceName || 'Owner') : S.me?.name || '';
 }
-function fmtDate(ts) {
-  if (!ts) return '';
-  return new Date(ts).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
-}
-const native = () => window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform();
-async function saveNative(bytes, filename, mime) {
-  // Android app: write to cache, then open the share sheet (Print, Drive, Files, email...)
-  const { Filesystem, Share } = window.Capacitor.Plugins;
-  const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
-  let s = ''; for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
-  const res = await Filesystem.writeFile({ path: filename, data: btoa(s), directory: 'CACHE' });
-  await Share.share({ title: filename, url: res.uri, dialogTitle: 'Save or print ' + filename });
-}
-function saveFile(bytes, filename, mime = 'application/pdf') {
-  if (native()) { saveNative(bytes, filename, mime).catch(err => toast('Could not save the file: ' + err.message, 'error')); return; }
-  const blob = new Blob([bytes], { type: mime });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url; a.download = filename;
-  document.body.appendChild(a); a.click(); a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 60000);
-}
-function openPdf(bytes) {
-  if (native()) return saveFile(bytes, 'stickers.pdf');
-  const url = URL.createObjectURL(new Blob([bytes], { type: 'application/pdf' }));
-  const w = window.open(url, '_blank');
-  if (!w) saveFile(bytes, 'labels.pdf');
-}
-function slug(s) { return String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'show'; }
-function readFile(file) {
-  return new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = () => rej(r.error); r.readAsArrayBuffer(file); });
-}
-function readText(file) {
-  return new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = () => rej(r.error); r.readAsText(file); });
-}
-function setShow(id) {
-  state.showId = id;
-  try { localStorage.setItem('currentShow', id || ''); } catch (e) { /* ignore */ }
-}
-async function currentShow() {
-  if (!state.showId) return null;
-  return db.get('shows', state.showId);
-}
-async function showData(showId) {
-  const [trays, items, orders, batches, scans] = await Promise.all([
-    db.byIndex('trays', 'showId', showId), db.byIndex('items', 'showId', showId),
-    db.byIndex('orders', 'showId', showId), db.byIndex('batches', 'showId', showId),
-    db.byIndex('scans', 'showId', showId),
-  ]);
-  trays.sort((a, b) => a.number - b.number);
-  batches.sort((a, b) => a.createdAt - b.createdAt);
-  return { trays, items, orders, batches, scans };
-}
-function needShow(title) {
-  view().innerHTML = `<section class="panel empty"><h1>${esc(title)}</h1><p>Pick or create a show first.</p><a class="btn primary" href="#shows">Go to shows</a></section>`;
-}
-async function refreshTrayStatus(showId, trayNumber) {
-  const trays = await db.byIndex('trays', 'showId', showId);
-  const t = trays.find(t => t.number === trayNumber);
-  if (!t) return null;
-  const items = (await db.byIndex('items', 'showId', showId)).filter(i => i.trayNumber === trayNumber);
-  t.itemCount = items.length;
-  t.inTray = items.filter(i => i.status !== 'sold').length;
-  t.packedCount = items.filter(i => i.status === 'packed').length;
-  if (t.status !== 'shipped') t.status = items.length && t.packedCount === items.length ? 'packed' : 'open';
-  await db.put('trays', t);
-  return t;
-}
-async function logScan(showId, code, mode, result, trayNumber) {
-  await db.put('scans', { id: db.uid('s'), showId, code, mode, result, trayNumber: trayNumber ?? null, at: Date.now() });
-}
-async function updateShowLabel() {
-  const s = await currentShow();
-  $('#current-show').textContent = s ? s.name : 'No show selected';
+function markNav(name) {
+  const map = { show: 'shows', import: 'shows', '': isPhone() ? 'dash' : S.owner ? 'shows' : 'dash' };
+  const n = map[name] ?? name;
+  $$('[data-nav]').forEach(a => {
+    let on = a.dataset.nav === n;
+    if (name === 'show') { const tab = location.hash.split('/')[2] || ''; if (a.closest('#tabbar')) on = { sort: 'tray-scan', trays: 'trays', pack: 'box-scan', labels: 'box-scan', handover: 'dash', overview: 'dash', scans: 'dash' }[tab.split('?')[0]] === a.dataset.nav; }
+    a.classList.toggle('on', on);
+  });
 }
 
-// ---------- Shows ----------
-async function viewShows() {
-  const shows = (await db.all('shows')).sort((a, b) => b.createdAt - a.createdAt);
-  const stats = await Promise.all(shows.map(async s => {
-    const { trays, items } = await showData(s.id);
-    return { trays: trays.length, items: items.length, inTray: items.filter(i => i.status !== 'sold').length, packed: items.filter(i => i.status === 'packed').length };
-  }));
-  const d0 = new Date(); const today = `${d0.getFullYear()}-${String(d0.getMonth() + 1).padStart(2, '0')}-${String(d0.getDate()).padStart(2, '0')}`;
-  view().innerHTML = `
-  <section class="panel">
-    <h1>Shows</h1>
-    <form id="new-show" class="row wrap">
-      <label class="grow">Show name<input id="show-name" required placeholder="Friday night toys LIVE" maxlength="80"></label>
-      <label>Date<input id="show-date" type="date" value="${today}"></label>
-      <button class="btn primary" type="submit">New show</button>
-    </form>
-  </section>
-  <section class="list">
-    ${shows.length ? shows.map((s, i) => `
-      <article class="show-card ${s.id === state.showId ? 'current' : ''}">
-        <div class="grow">
-          <h2>${esc(s.name)}</h2>
-          <p class="muted">${esc(s.date || '')}${s.id === state.showId ? ' · current show' : ''}</p>
-          <div class="stats">
-            <span><b>${stats[i].trays}</b> trays</span>
-            <span><b>${stats[i].items}</b> items</span>
-            <span><b>${stats[i].inTray}</b> in trays</span>
-            <span><b>${stats[i].packed}</b> packed</span>
-          </div>
-          ${stats[i].items ? `<div class="bar"><i style="width:${Math.round(stats[i].packed / stats[i].items * 100)}%"></i></div>` : ''}
-        </div>
-        <div class="col">
-          ${s.id === state.showId ? '' : `<button class="btn" data-act="select" data-id="${s.id}">Open</button>`}
-          <button class="btn ghost danger" data-act="delete" data-id="${s.id}">Delete</button>
-        </div>
-      </article>`).join('') : `<p class="muted pad">No shows yet. Create one above, then print sticker batches for it.</p>`}
-  </section>`;
-  $('#new-show').onsubmit = async e => {
-    e.preventDefault();
-    const s = { id: db.uid('show'), name: $('#show-name').value.trim(), date: $('#show-date').value, createdAt: Date.now() };
-    await db.put('shows', s);
-    setShow(s.id);
-    await updateShowLabel();
-    toast('Show created');
-    location.hash = '#stickers';
-  };
-  view().onclick = async e => {
-    const b = e.target.closest('[data-act]');
-    if (!b) return;
-    if (b.dataset.act === 'select') { setShow(b.dataset.id); await updateShowLabel(); viewShows(); }
-    if (b.dataset.act === 'delete') {
-      if (b.dataset.confirm !== '1') { b.dataset.confirm = '1'; b.textContent = 'Tap again to delete'; return; }
-      const id = b.dataset.id;
-      for (const st of ['batches', 'orders', 'trays', 'items', 'scans', 'files']) await db.delWhere(st, 'showId', id);
-      await db.del('shows', id);
-      if (state.showId === id) setShow(null);
-      await updateShowLabel();
-      toast('Show deleted');
-      viewShows();
+// ================= routing =================
+const PACKER_OK = new Set(['dash', 'tray-scan', 'trays', 'box-scan', 'settings', 'help', 'show']);
+async function route() {
+  stopCamera();
+  S.scanHandler = null; S.refresh = null;
+  $$('.modal-back').forEach(m => m.remove());
+  const [path, qs] = location.hash.slice(1).split('?');
+  const params = new URLSearchParams(qs || '');
+  const parts = (path || '').split('/');
+  let name = parts[0];
+  if (!name) name = isPhone() || !S.owner ? 'dash' : 'shows';
+  markNav(parts[0] ? name : '');
+  if (!S.owner && !PACKER_OK.has(name)) name = 'dash';
+  try {
+    if (name === 'show') {
+      const tab = parts[2] || 'overview';
+      if (!S.owner && !['sort', 'trays', 'pack', 'handover', 'scans', 'overview'].includes(tab)) return viewShow(parts[1], 'sort', params);
+      await viewShow(decodeURIComponent(parts[1] || ''), tab, params);
+    } else if (name === 'tray-scan' || name === 'trays' || name === 'box-scan') {
+      const tab = { 'tray-scan': 'sort', trays: 'trays', 'box-scan': 'pack' }[name];
+      if (!S.showId || !db.getShow(S.showId)) return noShow({ sort: 'Scan to Tray', trays: 'Trays', pack: 'Scan to Box' }[tab]);
+      await viewShow(S.showId, tab, params);
+    } else {
+      const fn = { dash: viewDash, shows: viewShows, import: viewImport, labels: viewLabels, analytics: viewAnalytics, team: viewTeam, settings: viewSettings, help: viewHelp }[name] || viewShows;
+      await fn(params);
     }
-  };
+  } catch (err) {
+    console.error(err);
+    view().innerHTML = `<section class="panel"><h1>Something went wrong</h1><p>${esc(err.message)}</p><a class="btn" href="#">Back to start</a></section>`;
+  }
+  if (!params.get('keep')) window.scrollTo(0, 0);
 }
 
-// ---------- Stickers ----------
-async function viewStickers() {
-  const show = await currentShow();
-  if (!show) return needShow('Stickers');
-  const { batches, items } = await showData(show.id);
-  const allBatches = batches; // sticker numbers only need to be unique within a show
-  view().innerHTML = `
-  <section class="panel">
-    <h1>Sticker batches</h1>
-    <p class="muted">Print numbered stickers before you go live. Stick the next one on each item as it sells. Name a TikTok listing after the batch (for example "${esc(batches[0]?.name || 'Toys')}") so the sticker number shows on the packing slip.</p>
-    <form id="batch-form" class="grid-form">
-      <label>Batch name<input id="b-name" required maxlength="40" placeholder="Toys"></label>
-      <label>Code prefix<input id="b-prefix" required maxlength="4" pattern="[A-Za-z0-9]{1,4}" placeholder="TOY" style="text-transform:uppercase"></label>
-      <label>First number<input id="b-start" type="number" min="1" max="99999" value="1" required></label>
-      <label>How many (max 1000)<input id="b-count" type="number" min="1" max="1000" value="100" required></label>
-      <div class="preview-wrap"><span class="muted small">Preview</span><canvas id="b-preview" width="400" height="200"></canvas></div>
-      <button class="btn primary" type="submit">Create batch and download PDF</button>
-    </form>
-  </section>
-  <section class="list">
-    ${batches.map(b => {
-      const used = items.filter(i => i.code.startsWith(b.prefix)).length;
-      return `<article class="show-card">
-        <div class="grow"><h2>${esc(b.name)} <span class="code">${esc(stickerCode(b, b.start))} – ${esc(stickerCode(b, b.start + b.count - 1))}</span></h2>
-        <p class="muted">${b.count} stickers · ${used} matched to orders · created ${fmtDate(b.createdAt)}</p></div>
-        <div class="col">
-          <button class="btn" data-act="dl" data-id="${b.id}">Download PDF</button>
-          <button class="btn ghost" data-act="open" data-id="${b.id}">Open to print</button>
-          <button class="btn ghost danger" data-act="del" data-id="${b.id}">Delete</button>
-        </div></article>`;
-    }).join('') || '<p class="muted pad">No batches for this show yet.</p>'}
-  </section>`;
-  const nameEl = $('#b-name'), prefixEl = $('#b-prefix'), startEl = $('#b-start');
-  const draw = () => {
-    const c = $('#b-preview'), g = c.getContext('2d');
-    g.fillStyle = '#fff'; g.fillRect(0, 0, c.width, c.height);
-    g.fillStyle = '#000';
-    const b = { prefix: (prefixEl.value || 'TOY').toUpperCase(), pad: 4 };
-    const code = stickerCode(b, +startEl.value || 1);
-    g.font = '18px sans-serif'; g.fillText(nameEl.value || 'Toys', 14, 28);
-    g.font = 'bold 18px sans-serif'; g.textAlign = 'right'; g.fillText('#' + (+startEl.value || 1), 386, 28); g.textAlign = 'left';
-    try { drawToCanvas(g, code, 24, 40, 352, 100); } catch (e) { /* invalid */ }
-    g.font = 'bold 34px sans-serif'; g.textAlign = 'center'; g.fillText(code, 200, 184); g.textAlign = 'left';
-  };
-  const suggestStart = () => {
-    const p = prefixEl.value.toUpperCase();
-    const same = allBatches.filter(b => b.prefix === p);
-    const next = same.reduce((m, b) => Math.max(m, b.start + b.count), 1);
-    startEl.value = next;
-  };
-  nameEl.oninput = () => {
-    if (!prefixEl.dataset.touched) { prefixEl.value = nameEl.value.replace(/[^A-Za-z0-9]/g, '').slice(0, 3).toUpperCase(); suggestStart(); }
-    draw();
-  };
-  prefixEl.oninput = () => { prefixEl.dataset.touched = '1'; suggestStart(); draw(); };
-  startEl.oninput = draw;
-  draw();
-  $('#batch-form').onsubmit = async e => {
-    e.preventDefault();
-    const b = {
-      id: db.uid('batch'), showId: show.id, name: nameEl.value.trim(), prefix: prefixEl.value.toUpperCase().trim(),
-      start: +startEl.value, count: Math.min(1000, +$('#b-count').value), pad: 4, createdAt: Date.now(),
+// ================= sign in / join =================
+function signInScreen(mode, joinCode, note) {
+  document.body.classList.add('signed-out');
+  const draw = m => {
+    view().innerHTML = `<section class="panel signin">
+      <div class="brand-big"><img src="icons/icon-192.png" alt="" width="56" height="56"><h1>ShopOps <b>Pack</b></h1></div>
+      <div class="seg wide"><button data-m="owner" class="${m === 'owner' ? 'on' : ''}">Owner login</button><button data-m="join" class="${m === 'join' ? 'on' : ''}">Join your team</button></div>
+      ${note ? `<p class="notice">${note}</p>` : ''}
+      ${m === 'owner' ? `
+      <form id="si-form" class="stack">
+        <label>Email<input id="si-email" type="email" autocomplete="username" required></label>
+        <label>Password<input id="si-pass" type="password" autocomplete="current-password" required minlength="6"></label>
+        <button class="btn primary">Sign in</button>
+      </form>
+      <p class="muted small">The business owner's login. Every phone and computer signed in sees the same shows, trays and scans, live.</p>` : `
+      <form id="join-form" class="stack">
+        <label>Team code<input id="j-code" autocapitalize="characters" autocomplete="off" placeholder="e.g. JULIAN-7262" value="${esc(joinCode || '')}" required></label>
+        <label>Your name<input id="j-name" autocomplete="name" placeholder="So the team knows who scanned what" required maxlength="40"></label>
+        <button class="btn primary">Join</button>
+      </form>
+      <p class="muted small">No password needed. The owner gets your request and taps Approve. Packers can scan and pack — nothing else.</p>`}
+      <p class="small" id="si-msg"></p>
+    </section>`;
+    $$('.seg [data-m]').forEach(b => { b.onclick = () => draw(b.dataset.m); });
+    const msg = t => { $('#si-msg').textContent = t; };
+    const f = $('#si-form');
+    if (f) f.onsubmit = async e => {
+      e.preventDefault(); msg('Signing in…');
+      try { await db.signInOwner($('#si-email').value, $('#si-pass').value); location.reload(); }
+      catch (err) { msg({ 'auth/invalid-credential': 'Wrong email or password.', 'auth/wrong-password': 'Wrong email or password.', 'auth/user-not-found': 'Wrong email or password.', 'auth/network-request-failed': 'No internet connection. Connect and try again.', 'auth/too-many-requests': 'Too many tries. Wait a few minutes and try again.' }[err.code] || err.message); }
     };
-    const clash = allBatches.find(x => x.prefix === b.prefix && b.start < x.start + x.count && x.start < b.start + b.count);
-    if (clash) { toast(`Numbers overlap batch "${clash.name}" (${stickerCode(clash, clash.start)}–${stickerCode(clash, clash.start + clash.count - 1)}). Change the first number or prefix.`, 'error'); return; }
-    await db.put('batches', b);
-    toast('Building sticker PDF…');
-    const bytes = await stickerBatchPdf(b, state.settings);
-    saveFile(bytes, `${slug(b.name)}-stickers-${b.start}-${b.start + b.count - 1}.pdf`);
-    viewStickers();
+    const j = $('#join-form');
+    if (j) j.onsubmit = e => { e.preventDefault(); doJoin($('#j-code').value, $('#j-name').value, msg); };
   };
-  view().onclick = async e => {
-    const btn = e.target.closest('[data-act]'); if (!btn) return;
-    const b = await db.get('batches', btn.dataset.id);
-    if (btn.dataset.act === 'dl' || btn.dataset.act === 'open') {
-      const bytes = await stickerBatchPdf(b, state.settings);
-      if (btn.dataset.act === 'dl') saveFile(bytes, `${slug(b.name)}-stickers-${b.start}-${b.start + b.count - 1}.pdf`); else openPdf(bytes);
-    }
-    if (btn.dataset.act === 'del') {
-      if (btn.dataset.confirm !== '1') { btn.dataset.confirm = '1'; btn.textContent = 'Tap again to delete'; return; }
-      await db.del('batches', b.id); viewStickers();
-    }
-  };
+  draw(mode);
+}
+async function doJoin(code, name, msg) {
+  msg('Sending your request…');
+  try {
+    if (!db.currentUser()) await db.signInPacker();
+    await db.requestJoin(code, name);
+    location.reload();
+  } catch (err) {
+    console.error(err);
+    msg(err.code === 'permission-denied' ? "That team code isn't right. Check it with the owner (it may have been changed)." : err.code === 'auth/operation-not-allowed' || err.code === 'auth/admin-restricted-operation' ? 'Joining is switched off for this team right now. Tell the owner.' : 'Could not join: ' + err.message);
+  }
+}
+function joinScreen(code, note) {
+  signInScreen('join', code, note);
+}
+function waitingScreen(me) {
+  document.body.classList.add('signed-out');
+  view().innerHTML = `<section class="panel signin center">
+    <div class="spinner"></div><h1>Waiting for approval</h1>
+    <p>Hi <b>${esc(me.name)}</b>. Your request to join is with the owner. This screen opens by itself as soon as they tap <b>Approve</b>.</p>
+    <button class="btn ghost" id="cancel-join">Cancel and start over</button></section>`;
+  $('#cancel-join').onclick = async () => { await db.removeMember(me.uid).catch(() => {}); db.signOut(); };
+}
+function blockedScreen(me) {
+  document.body.classList.add('signed-out');
+  view().innerHTML = `<section class="panel signin center"><h1>Access paused</h1><p>The owner has deactivated <b>${esc(me.name)}</b> on this team. Ask them to reactivate you on the Team page.</p>
+    <button class="btn ghost" id="so">Sign out</button></section>`;
+  $('#so').onclick = () => db.signOut();
 }
 
-// ---------- Import ----------
-async function viewImport() {
-  const show = await currentShow();
-  if (!show) return needShow('Import orders');
-  const { batches, orders } = await showData(show.id);
-  const p = state.pendingImport && state.pendingImport.showId === show.id ? state.pendingImport : null;
+// ================= Shows (home) =================
+let showsLimit = 20;
+function showStatus(s) {
+  const m = s.sum;
+  if (!m || !m.items) return ['Not started', 'grey'];
+  if (m.handed >= m.trays && m.trays) return ['Shipped', 'green'];
+  if (m.boxes >= m.trays && m.trays) return ['Packed', 'green'];
+  if (m.packed) return ['Packing', 'blue'];
+  if (m.inTray >= m.items) return ['Sorted', 'blue'];
+  if (m.inTray) return ['Sorting', 'amber'];
+  return ['Not started', 'grey'];
+}
+function viewShows(params) {
+  const q = (params.get('q') || '').toLowerCase();
+  const all = db.shows().sort((a, b) => (b.date || '').localeCompare(a.date || '') || (b.createdAt || 0) - (a.createdAt || 0));
+  const list = all.filter(s => !q || s.name.toLowerCase().includes(q));
+  const tot = all.reduce((t, s) => { const m = s.sum || {}; t.items += m.items ?? s.itemCount ?? 0; t.buyers += m.buyers ?? 0; t.rev += m.revenue ?? 0; t.scans += m.scans ?? 0; return t; }, { items: 0, buyers: 0, rev: 0, scans: 0 });
+  const cur = S.showId && db.getShow(S.showId);
   view().innerHTML = `
+  <div class="home-head"><div><h1>Shows</h1><p class="muted">Import a finished show to sort it into trays and pack it — or print numbered stickers before you go live.</p></div></div>
+  <div class="home-cards">
+    <a class="card big-link" href="#import"><span class="ico">📦</span><div><b>Pack a finished show</b><span class="muted small">Add the labels + packing slips PDF. Trays are made for you: biggest buyer gets Tray 1.</span></div><span>›</span></a>
+    <a class="card big-link" href="#labels"><span class="ico">🏷️</span><div><b>Pre-show labels</b><span class="muted small">Print numbered stickers to put on items as they sell during the live.</span></div><span>›</span></a>
+    ${cur ? `<a class="card big-link accent" href="#show/${esc(cur.id)}/overview"><span class="ico">▶</span><div><b>Continue: ${esc(cur.name)}</b><span class="muted small">${cur.sum ? `${pctFloor(cur.sum.inTray, cur.sum.items)}% sorted · ${cur.sum.boxes}/${cur.sum.trays} boxes packed` : 'Not started'}</span></div><span>›</span></a>` : ''}
+  </div>
+  ${all.length ? `<div class="kpis"><span><b>${all.length}</b> shows</span><span><b>${nf(tot.items)}</b> items</span><span><b>${nf(tot.buyers)}</b> buyers</span>${hideRev() ? '' : `<span><b>${money(tot.rev)}</b> sales</span>`}<span><b>${nf(tot.scans)}</b> scans</span></div>` : ''}
   <section class="panel">
-    <h1>Import orders</h1>
-    <p class="muted">After the live, download TikTok Shop's shipping labels with packing slips as one PDF and add it here. Several PDFs from the same show are combined. You can also import an order CSV export.</p>
-    ${batches.length ? '' : '<p class="notice">This show has no sticker batches yet. Orders can still be imported, but sticker numbers can only be matched once a batch exists.</p>'}
-    <div class="drop" id="drop">
-      <input id="pdf-input" type="file" accept="application/pdf,.pdf,.csv,text/csv" multiple>
-      <p><b>Choose PDF or CSV files</b><br><span class="muted">or drop them here</span></p>
-    </div>
-    <p id="progress" class="muted small"></p>
+    <div class="row between wrap"><h2>Recent shows</h2><input class="search" id="sh-q" placeholder="Search shows" value="${esc(q)}"></div>
+    ${list.length ? `<div class="table-wrap"><table class="tbl click">
+      <thead><tr><th>Show</th><th>Date</th><th>Platform</th><th>Items</th><th>Buyers</th><th>Sorted</th><th>Boxes</th><th>Status</th></tr></thead>
+      <tbody>${list.slice(0, showsLimit).map(s => { const m = s.sum || {}; const [st, col] = showStatus(s); return `<tr data-go="${esc(s.id)}">
+        <td><b>${esc(s.name)}</b>${s.sample ? ' <span class="pill">Practice</span>' : ''}</td><td>${fmtDateStr(s.date)}</td><td>${s.platform === 'whatnot' ? 'Whatnot' : 'TikTok Shop'}</td>
+        <td>${m.items ?? s.itemCount ?? 0}</td><td>${m.buyers ?? '—'}</td><td>${m.items ? pctFloor(m.inTray, m.items) + '%' : '0%'}</td><td>${m.trays ? m.boxes + '/' + m.trays : (s.trayCount || 0) ? '0/' + s.trayCount : '—'}</td>
+        <td><span class="status-pill ${col}">${st}</span></td></tr>`; }).join('')}</tbody></table></div>
+      ${list.length > showsLimit ? '<button class="btn ghost" id="more">Load more</button>' : ''}` : `<div class="empty"><p class="muted">${q ? 'No shows match.' : 'No shows yet.'}</p>${q ? '' : '<button class="btn" id="sample">Practise on a sample show</button>'}</div>`}
+  </section>`;
+  $$('[data-go]').forEach(tr => { tr.onclick = () => { setShowId(tr.dataset.go); location.hash = '#show/' + tr.dataset.go + '/overview'; }; });
+  const sq = $('#sh-q');
+  sq.oninput = () => { clearTimeout(sq._t); sq._t = setTimeout(() => { location.hash = '#shows' + (sq.value ? '?keep=1&q=' + encodeURIComponent(sq.value) : ''); setTimeout(() => { const n = $('#sh-q'); if (n) { n.focus(); n.setSelectionRange(n.value.length, n.value.length); } }, 50); }, 300); };
+  const mb = $('#more'); if (mb) mb.onclick = () => { showsLimit += 20; viewShows(params); };
+  const sb = $('#sample'); if (sb) sb.onclick = makeSample;
+}
+
+// ================= Import =================
+let pending = null; // parsed import waiting for "Create show"
+const today = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; };
+function viewImport() {
+  const plat = pending?.platform || localStorage.getItem('platform') || 'tiktok';
+  view().innerHTML = `
+  <a class="back" href="#shows">← All shows</a>
+  <h1>Pack a finished show</h1>
+  <section class="panel">
+    <h3>1. Where did you sell?</h3>
+    <div class="choice-row"><button class="choice ${plat === 'tiktok' ? 'on' : ''}" data-p="tiktok"><b>TikTok Shop</b><span class="small muted">Shipping labels + packing slips PDF from Seller Center</span></button>
+      <button class="choice ${plat === 'whatnot' ? 'on' : ''}" data-p="whatnot"><b>Whatnot</b><span class="small muted">Labels + packing slips PDF from the seller hub</span></button></div>
+    <h3>2. Add the PDF</h3>
+    <p class="muted small">${plat === 'whatnot' ? 'In Whatnot: Shipments → select the show → Print labels (with packing slips).' : 'In Seller Center: Orders → select the LIVE\'s orders → Print → <b>Shipping label and packing list</b>.'} Got several PDFs from the same show? Add them all — they're stitched together. Only have packing slips? That works too; add the labels later on the show's Labels step.</p>
+    <label class="drop" id="drop"><input id="files" type="file" accept="application/pdf,.pdf,.csv,text/csv" multiple><b>Choose PDF files</b><span class="muted">or drop them here · an order CSV also works</span></label>
+    <p class="muted small" id="prog"></p>
+    <p class="small">New to this? <button class="link" id="sample">Practise on a sample show</button> — fake orders, nothing real is touched.</p>
   </section>
-  ${p ? renderPreview(p) : ''}
-  ${orders.length ? `
-  <section class="panel">
-    <h2>Add shipping labels later</h2>
-    <p class="muted">Imported packing slips only? Add the labels PDF here. Pages are matched by order ID, or by order of appearance when the counts match.</p>
-    <input id="labels-input" type="file" accept="application/pdf,.pdf">
-  </section>` : ''}`;
+  <div id="preview"></div>`;
+  $$('[data-p]').forEach(b => { b.onclick = () => { localStorage.setItem('platform', b.dataset.p); if (pending) pending.platform = b.dataset.p; viewImport(); }; });
+  $('#sample').onclick = makeSample;
   const handle = async files => {
     if (!files.length) return;
-    const prog = $('#progress');
+    const prog = $('#prog');
     try {
       const pdfs = [], csvs = [];
-      for (const f of files) (/\.csv$/i.test(f.name) || f.type.includes('csv') ? csvs : pdfs).push(f);
+      files.forEach(f => (/\.csv$/i.test(f.name) || /csv/.test(f.type) ? csvs : pdfs).push(f));
       const stored = [];
-      for (const f of pdfs) stored.push({ id: db.uid('file'), showId: show.id, name: f.name, kind: 'tiktok-pdf', bytes: await readFile(f), addedAt: Date.now() });
-      let parsed = { orders: [], unmatchedLabels: [], pageCount: 0 };
-      if (stored.length) parsed = await parsePdfs(stored, batches, state.settings, m => { prog.textContent = 'Reading ' + m; });
-      for (const f of csvs) {
-        const r = ordersFromCsv(await readText(f), batches, state.settings);
-        parsed.orders.push(...r.orders);
-      }
+      for (const f of pdfs) stored.push({ id: db.uid('file'), name: f.name, kind: 'import', bytes: await readFile(f), addedAt: Date.now() });
+      let parsed = { orders: [], unmatchedLabels: [], pageCount: 0, labelPages: 0 };
+      if (stored.length) parsed = await parsePdfs(stored, m => { prog.textContent = 'Reading ' + m; });
+      for (const f of csvs) parsed.orders.push(...ordersFromCsv(await readText(f)).orders);
       prog.textContent = '';
-      if (!parsed.orders.length) { toast('No packing slips or orders were found in these files.', 'error'); return; }
-      state.pendingImport = { showId: show.id, files: stored, parsed, names: files.map(f => f.name) };
-      viewImport();
-    } catch (err) {
-      console.error(err); prog.textContent = '';
-      toast('Could not read the file: ' + err.message, 'error');
-    }
+      if (!parsed.orders.length) return toast("No packing slips were found in these files. Make sure the PDF includes packing slips (TikTok: 'Shipping label and packing list').", 'error');
+      const first = files[0].name.replace(/\.(pdf|csv)$/i, '');
+      pending = { files: stored, parsed, platform: plat, name: /^\d|label|slip|print|order/i.test(first) ? `Show ${fmtDateStr(today())}` : first, date: today() };
+      drawPreview();
+    } catch (err) { console.error(err); prog.textContent = ''; toast('Could not read the file: ' + err.message, 'error'); }
   };
-  $('#pdf-input').onchange = e => handle([...e.target.files]);
+  $('#files').onchange = e => handle([...e.target.files]);
   const drop = $('#drop');
   drop.ondragover = e => { e.preventDefault(); drop.classList.add('over'); };
   drop.ondragleave = () => drop.classList.remove('over');
   drop.ondrop = e => { e.preventDefault(); drop.classList.remove('over'); handle([...e.dataTransfer.files]); };
-  const li = $('#labels-input');
-  if (li) li.onchange = async e => {
-    const f = e.target.files[0]; if (!f) return;
-    const file = { id: db.uid('file'), showId: show.id, name: f.name, kind: 'labels-pdf', bytes: await readFile(f), addedAt: Date.now() };
-    const r = await parseLabelsOnly(file, orders);
-    if (!r.assignments.length) { toast(`No label pages could be matched (${r.pageCount} pages, ${orders.length} orders).`, 'error'); return; }
-    await db.put('files', file);
-    for (const a of r.assignments) { a.order.labelPages = [a.ref]; await db.put('orders', a.order); }
-    toast(`${r.assignments.length} labels matched${r.positional ? ' by page order' : ''}${r.leftovers.length ? `, ${r.leftovers.length} pages unmatched` : ''}.`, r.leftovers.length ? 'warn' : 'ok');
-    viewImport();
-  };
-  bindPreview(show);
+  if (pending) drawPreview();
 }
-
-function renderPreview(p) {
-  const plan = planTrays(p.parsed.orders, [], []); // order-only preview grouping
-  const noCodes = p.parsed.orders.filter(o => !o.codes.length);
-  const noLabel = p.files.length ? p.parsed.orders.filter(o => !o.labelPages.length) : [];
-  const qtyGap = p.parsed.orders.filter(o => o.qty && o.codes.length && o.qty !== o.codes.length);
-  return `<section class="panel">
+function drawPreview() {
+  const p = pending, per = prefs().perTray;
+  const plan = planShow(p.parsed.orders, per);
+  const noNum = p.parsed.orders.filter(o => !o.items.length);
+  const withLabel = p.parsed.orders.filter(o => o.labelPages.length).length;
+  const split = new Set(plan.trays.filter(t => t.part > 0).map(t => t.buyerKey)).size;
+  const buyers = new Set(plan.trays.map(t => t.buyerKey)).size;
+  $('#preview').innerHTML = `<section class="panel">
     <h2>Check before creating trays</h2>
-    <div class="stats big">
-      <span><b>${p.parsed.orders.length}</b> orders</span>
-      <span><b>${plan.length}</b> buyers</span>
-      <span><b>${p.parsed.orders.reduce((n, o) => n + o.codes.length, 0)}</b> stickers found</span>
-      ${p.files.length ? `<span><b>${p.parsed.orders.length - noLabel.length}</b> labels matched</span>` : ''}
-    </div>
-    ${noCodes.length ? `<p class="notice">${noCodes.length} order${noCodes.length > 1 ? 's have' : ' has'} no sticker number. Type the numbers below (for example <span class="code">12, 15</span>) or leave blank to pack those by hand.</p>` : ''}
-    ${noLabel.length ? `<p class="notice">${noLabel.length} order${noLabel.length > 1 ? 's have' : ' has'} no shipping label page in the PDF.</p>` : ''}
-    ${p.parsed.unmatchedLabels.length ? `<p class="notice">${p.parsed.unmatchedLabels.length} label page${p.parsed.unmatchedLabels.length > 1 ? 's' : ''} could not be linked to an order.</p>` : ''}
-    ${qtyGap.length ? `<p class="notice">${qtyGap.length} order${qtyGap.length > 1 ? 's list' : ' lists'} a quantity that differs from the stickers found.</p>` : ''}
-    <div class="table-wrap"><table>
-      <thead><tr><th>Order</th><th>Buyer</th><th>Stickers</th><th>Qty</th><th>Label</th></tr></thead>
-      <tbody>${p.parsed.orders.map((o, i) => `<tr class="${o.codes.length ? '' : 'flag'}">
-        <td class="code small">${esc(o.orderId.startsWith('slip-') ? '—' : o.orderId)}</td>
-        <td><input class="inline" data-buyer="${i}" value="${esc(o.buyer)}" placeholder="Buyer name"></td>
-        <td>${o.codes.length ? o.codes.map(c => `<span class="chip">${esc(c)}</span>`).join(' ') : `<input class="inline" data-codes="${i}" placeholder="Sticker numbers">`}</td>
-        <td>${o.qty ?? ''}</td>
-        <td>${o.labelPages.length ? 'Yes' : (p.files.length ? '<span class="warn-text">Missing</span>' : '—')}</td>
-      </tr>`).join('')}</tbody>
-    </table></div>
-    <div class="row">
-      <button class="btn primary" id="commit-import">Create trays</button>
-      <button class="btn ghost" id="cancel-import">Discard</button>
-    </div>
+    <div class="kpis"><span><b>${p.parsed.orders.length}</b> orders</span><span><b>${plan.items.length}</b> items</span><span><b>${buyers}</b> buyers</span><span><b>${plan.trays.length}</b> trays</span><span><b>${withLabel}</b> labels matched</span></div>
+    ${noNum.length ? `<p class="notice">${noNum.length} order${noNum.length === 1 ? '' : 's'} had no sticker number (#…) on the slip. They still get a tray; tick them off by hand.</p>` : ''}
+    ${withLabel < p.parsed.orders.length && p.parsed.labelPages ? `<p class="notice">${p.parsed.orders.length - withLabel} order${p.parsed.orders.length - withLabel === 1 ? '' : 's'} had no shipping label in the PDF.</p>` : ''}
+    ${!p.parsed.labelPages && p.files.length ? '<p class="notice">Packing slips only — add the shipping labels later on the show\'s Labels step.</p>' : ''}
+    ${split ? `<p class="muted small">${split} buyer${split === 1 ? '' : 's'} bought more than ${per} items, so they get more than one tray.</p>` : ''}
+    <div class="grid2"><label>Show name<input id="pv-name" value="${esc(p.name)}"></label><label>Show date<input id="pv-date" type="date" value="${esc(p.date)}"></label></div>
+    <details><summary>See the trays (${plan.trays.length})</summary><div class="table-wrap"><table class="tbl"><thead><tr><th>Tray</th><th>Buyer</th><th>Items</th><th>Stickers</th></tr></thead><tbody>
+      ${plan.trays.map(t => `<tr><td><b>${t.n}</b></td><td>${esc(at(t.buyer))}${t.part ? ' <span class="muted small">(part ' + (t.part + 1) + ')</span>' : ''}</td><td>${t.items.length}</td><td class="small">${t.items.map(id => plan.items.find(i => i.id === id)).map(i => (i.num != null ? '#' + i.num : '—')).join(', ')}</td></tr>`).join('')}
+    </tbody></table></div></details>
+    <div class="row"><button class="btn primary" id="create">Create show</button><button class="btn ghost" id="discard">Discard</button></div>
   </section>`;
+  $('#pv-name').oninput = e => { p.name = e.target.value; };
+  $('#pv-date').oninput = e => { p.date = e.target.value; };
+  $('#discard').onclick = () => { pending = null; viewImport(); };
+  $('#create').onclick = async () => {
+    const id = db.uid('show');
+    const show = {
+      id, name: (p.name || '').trim() || 'Show', date: p.date || today(), platform: p.platform, createdAt: Date.now(),
+      trayCount: plan.trays.length, itemCount: plan.items.length, hasLabels: plan.orders.some(o => o.labelPages.length), noNumber: noNum.length, perTray: per,
+    };
+    await db.createShow(show, plan, p.files.map(f => ({ ...f, showId: id })));
+    pending = null; setShowId(id);
+    toast(`${plan.trays.length} trays ready`, 'ok');
+    location.hash = '#show/' + id + '/overview';
+  };
+}
+// A practice show with made-up orders
+async function makeSample() {
+  const names = ['squishqueen', 'mochi.mel', 'tay_buys', 'jaylen22', 'cozycrafts', 'nana.rose', 'kidzcorner', 'brookeee', 'dealhunter_nj', 'lilyypad', 'marcus.t', 'soft.things', 'ari_shops', 'zoe.collects', 'big.dawg.deals'];
+  const weights = [9, 7, 6, 5, 5, 4, 4, 3, 3, 3, 2, 2, 2, 1, 1];
+  const orders = []; let num = 1;
+  names.forEach((b, bi) => {
+    for (let k = 0; k < weights[bi]; k++) {
+      const n = num++;
+      orders.push({ orderId: 'PRACTICE' + (1000 + n), extraOrderIds: [], buyer: b, buyerKey: nameKey(b), items: [{ title: `Mystery Squishy #${n}`, name: 'Mystery Squishy', num: n, qty: 1, price: +(3 + ((n * 37) % 13)).toFixed(2) }], slipPages: [], labelPages: [], tracking: [], firstSeq: n });
+    }
+  });
+  const byBuyer = new Map();
+  orders.forEach(o => { if (!byBuyer.has(o.buyerKey)) byBuyer.set(o.buyerKey, '9400' + String(1e17 + Math.floor(Math.random() * 9e17)).slice(0, 18)); o.tracking = [byBuyer.get(o.buyerKey)]; });
+  const plan = planShow(orders, prefs().perTray);
+  const id = db.uid('show');
+  await db.createShow({ id, name: 'Practice show', date: today(), platform: 'tiktok', createdAt: Date.now(), trayCount: plan.trays.length, itemCount: plan.items.length, hasLabels: false, noNumber: 0, sample: true, perTray: prefs().perTray }, plan, []);
+  setShowId(id);
+  toast('Practice show ready. Print its stickers on Pre-show labels ("Mystery Squishy", 1 to ' + (num - 1) + '), or just type the numbers.', 'ok');
+  location.hash = '#show/' + id + '/overview';
 }
 
-function bindPreview(show) {
-  const p = state.pendingImport;
-  if (!p || p.showId !== show.id) return;
-  view().querySelectorAll('[data-buyer]').forEach(inp => inp.onchange = () => {
-    const o = p.parsed.orders[+inp.dataset.buyer]; o.buyer = inp.value.trim(); o.buyerKey = buyerKey(o.buyer) || 'order' + o.orderId;
-  });
-  $('#cancel-import').onclick = () => { state.pendingImport = null; viewImport(); };
-  $('#commit-import').onclick = async () => {
-    const { batches, trays: existingTrays, orders: existingOrders, items: existingItems } = await showData(show.id);
-    // manual sticker numbers
-    view().querySelectorAll('[data-codes]').forEach(inp => {
-      const o = p.parsed.orders[+inp.dataset.codes];
-      inp.value.split(/[\s,;]+/).filter(Boolean).forEach(tok => {
-        const up = tok.toUpperCase();
-        let b = batches.find(b => up.startsWith(b.prefix));
-        let n = parseInt(b ? up.slice(b.prefix.length) : up.replace(/\D/g, ''), 10);
-        if (!b) b = batches.find(b => n >= b.start && n < b.start + b.count);
-        if (b && n >= b.start && n < b.start + b.count) { const c = stickerCode(b, n); if (!o.codes.includes(c)) o.codes.push(c); }
+// ================= Pre-show labels =================
+function loadRows() { try { const r = JSON.parse(localStorage.getItem('preshowRows') || 'null'); if (Array.isArray(r) && r.length) return r; } catch (e) { /* ignore */ } return [{ name: '', from: 1, to: 100 }]; }
+function viewLabels() {
+  let rows = loadRows();
+  const plat = localStorage.getItem('platform') || 'tiktok';
+  const st = S.settings;
+  const draw = () => {
+    const total = rows.reduce((n, r) => n + Math.max(0, (+r.to || 0) - (+r.from || 0) + 1), 0);
+    view().innerHTML = `
+    <h1>Pre-show labels</h1>
+    <p class="muted">Print numbered stickers before you go live. Stick one on each item as it sells — the number is what the buyer sees on their order.</p>
+    <div class="ov-grid">
+    <section class="panel">
+      <div class="seg"><button data-p="tiktok" class="${plat === 'tiktok' ? 'on' : ''}">TikTok Shop</button><button data-p="whatnot" class="${plat === 'whatnot' ? 'on' : ''}">Whatnot</button></div>
+      <p class="muted small">${plat === 'whatnot' ? 'Use the same listing name you sell under, and number your lots to match the sticker.' : 'Name your TikTok LIVE auction listing exactly like the sticker (for example "Mystery Squishy #1" … "#100"), so the packing slips show the same name and number.'}</p>
+      <div class="pre-rows">${rows.map((r, i) => `<div class="pre-row">
+        <label class="grow">Listing name<input data-f="name" data-i="${i}" value="${esc(r.name)}" placeholder="e.g. Mystery Squishy" maxlength="40"></label>
+        <label>From #<input data-f="from" data-i="${i}" type="number" min="1" max="1000" value="${r.from}"></label>
+        <label>To #<input data-f="to" data-i="${i}" type="number" min="1" max="1000" value="${r.to}"></label>
+        ${rows.length > 1 ? `<button class="icon-btn" data-del="${i}" aria-label="Remove">✕</button>` : ''}</div>`).join('')}</div>
+      <button class="btn ghost small" id="add-row">+ Add another listing name</button>
+      <p class="muted small">Up to 1,000 sales per listing name. <button class="link" id="why">Why?</button></p>
+      <div class="row wrap"><button class="btn primary" id="print">Print labels (${nf(total)})</button><button class="btn" id="dl">Download PDF</button><button class="btn ghost" id="test">Test print</button></div>
+      <p class="muted small">Sticker size: ${st.labelWidthMm} × ${st.labelHeightMm} mm. <a href="#settings">Change</a></p>
+      <div class="sticker-preview"><div class="sticker" style="aspect-ratio:${st.labelWidthMm}/${st.labelHeightMm}"><div class="bars-fake"></div><b>${esc(rows[0].name || 'Listing name')} #${rows[0].from || 1}</b></div></div>
+    </section>
+    <aside>
+      <div class="card"><h3>How it works</h3><ol class="steps-list">
+        <li><b>Print</b> a roll of numbered stickers for each listing name.</li>
+        <li><b>Go live.</b> When an item sells, stick the next number on it and drop it in the "sold" pile.</li>
+        <li><b>After the show</b>, import the labels + packing slips PDF. Every buyer gets a tray — the biggest buyer gets Tray 1.</li>
+        <li><b>Scan</b> each sticker: the screen shows which tray it goes in. Then pack each tray into its box.</li></ol></div>
+      <div class="card"><h3>Printer tips</h3><ul class="plain small">
+        <li>Thermal label printers (Rollo, Munbyn, Zebra, Phomemo…): load ${st.labelWidthMm} × ${st.labelHeightMm} mm labels and set the paper size to match.</li>
+        <li>Print at <b>100% / actual size</b> — not "fit to page".</li>
+        <li>Do a <b>Test print</b> first and scan it to check the barcode reads.</li>
+        <li>Phone app: the PDF opens the share sheet — pick your printer's app or Print.</li></ul></div>
+    </aside></div>`;
+    $$('[data-p]').forEach(b => { b.onclick = () => { localStorage.setItem('platform', b.dataset.p); viewLabels(); }; });
+    $$('[data-f]').forEach(inp => { inp.oninput = () => { const r = rows[+inp.dataset.i]; r[inp.dataset.f] = inp.dataset.f === 'name' ? inp.value : parseInt(inp.value, 10) || ''; save(); const pb = $('#print'); if (pb) pb.textContent = `Print labels (${nf(rows.reduce((n, x) => n + Math.max(0, (+x.to || 0) - (+x.from || 0) + 1), 0))})`; }; });
+    $$('[data-del]').forEach(b => { b.onclick = () => { rows.splice(+b.dataset.del, 1); save(); draw(); }; });
+    $('#add-row').onclick = () => { rows.push({ name: '', from: 1, to: 100 }); save(); draw(); };
+    $('#why').onclick = () => modal(`<div class="modal-head"><h2>Why 1,000 per name?</h2><button class="icon-btn" data-close>✕</button></div>
+      <p>Each sticker is matched to the order by its listing name and number. Numbers stop at 1,000 so they stay short enough to read and type quickly.</p>
+      <p>Selling more than 1,000 under one name? Add a second listing name (for example "Mystery Squishy B") and start again from #1.</p>`);
+    $('#print').onclick = () => go('print');
+    $('#dl').onclick = () => go('download');
+    $('#test').onclick = () => go('test');
+  };
+  const save = () => { try { localStorage.setItem('preshowRows', JSON.stringify(rows)); } catch (e) { /* ignore */ } };
+  const go = async how => {
+    const ok = rows.map(r => ({ name: String(r.name || '').trim(), from: +r.from, to: +r.to }));
+    const bad = ok.find(r => !r.name || !(r.from >= 1) || !(r.to >= r.from) || r.to > 1000 || r.to - r.from >= 1000);
+    if (bad) return toast(!bad.name ? 'Type a listing name for every row.' : 'Numbers go from 1 up to 1,000, and "To" must be at least "From".', 'error');
+    toast('Making the labels…');
+    const bytes = await preShowPdf(ok, S.settings, how === 'test');
+    const name = how === 'test' ? 'test label.pdf' : `${ok.map(r => r.name).join(', ')} stickers.pdf`;
+    how === 'download' ? saveFile(bytes, name) : printPdf(bytes, name);
+  };
+  draw();
+}
+
+// ================= Analytics =================
+async function viewAnalytics(params) {
+  const days = +(params.get('d') || 30);
+  const now = Date.now(), from = now - days * 864e5, prevFrom = from - days * 864e5;
+  const inRange = (s, a, b) => { const t = s.sum?.last || s.createdAt || 0; return t >= a && t < b; };
+  const all = db.shows();
+  const cur = all.filter(s => inRange(s, from, now + 1)), prev = all.filter(s => inRange(s, prevFrom, from));
+  const agg = list => {
+    const out = { scans: 0, busy: 0, methods: {}, people: new Map(), items: 0 };
+    list.forEach(s => {
+      const m = s.sum || {}; out.scans += m.scans || 0; out.items += m.items || 0;
+      Object.entries(m.methods || {}).forEach(([k, v]) => { out.methods[k] = (out.methods[k] || 0) + v; });
+      (m.people || []).forEach(p => {
+        const x = out.people.get(p.key) || { name: p.name, kind: p.kind, tray: 0, box: 0, busy: 0, trayMs: 0, boxMs: 0 };
+        x.tray += p.tray || 0; x.box += p.box || 0; x.busy += p.busy || 0;
+        if (p.trayRate) x.trayMs += (p.tray / p.trayRate) * 3600000; if (p.boxRate) x.boxMs += (p.box / p.boxRate) * 3600000;
+        out.people.set(p.key, x); out.busy += p.busy || 0;
       });
     });
-    // merge with orders already imported for this show (re-import or part 2)
-    const known = new Map(existingOrders.map(o => [o.orderId, o]));
-    const merged = p.parsed.orders.map(o => {
-      const k = known.get(o.orderId);
-      return k ? { ...k, codes: [...new Set([...k.codes, ...o.codes])], labelPages: o.labelPages.length ? o.labelPages : k.labelPages, slipPages: o.slipPages.length ? o.slipPages : k.slipPages, buyer: o.buyer || k.buyer, buyerKey: o.buyerKey } : o;
-    });
-    const plan = planTrays(merged, batches, existingTrays);
-    const codeOwner = new Map(existingItems.map(i => [i.code, i]));
-    const conflicts = [];
-    await db.putMany('files', p.files);
-    const orderRows = [];
-    for (const g of plan) {
-      const tray = existingTrays.find(t => t.number === g.number) || { id: db.uid('tray'), showId: show.id, number: g.number, buyerKey: g.buyerKey, status: 'open', createdAt: Date.now(), orderIds: [] };
-      tray.buyer = g.buyer;
-      for (const o of g.orders) {
-        const row = { ...o, id: known.get(o.orderId)?.id || db.uid('ord'), showId: show.id, trayNumber: g.number };
-        orderRows.push(row);
-        if (!tray.orderIds.includes(row.id)) tray.orderIds.push(row.id);
-        for (const c of o.codes) {
-          const prev = codeOwner.get(c);
-          if (prev && prev.trayNumber !== g.number) { conflicts.push(c); continue; }
-          if (!prev) {
-            const it = { id: show.id + ':' + c, showId: show.id, code: c, trayNumber: g.number, buyer: g.buyer, orderId: o.orderId, status: 'sold', createdAt: Date.now() };
-            codeOwner.set(c, it);
-            await db.put('items', it);
-          }
-        }
-      }
-      await db.put('trays', tray);
-      await refreshTrayStatus(show.id, g.number);
-    }
-    await db.putMany('orders', orderRows);
-    state.pendingImport = null;
-    toast(`${plan.length} trays ready${conflicts.length ? `. ${conflicts.length} sticker numbers appear on two buyers' slips: ${conflicts.slice(0, 5).join(', ')}` : ''}.`, conflicts.length ? 'warn' : 'ok');
-    location.hash = '#trays';
+    return out;
   };
-}
-
-// ---------- Trays ----------
-async function viewTrays(params) {
-  const show = await currentShow();
-  if (!show) return needShow('Trays');
-  const { trays, items, orders } = await showData(show.id);
-  const filter = params.get('f') || 'all';
-  const sel = params.get('t') ? +params.get('t') : null;
-  const list = trays.filter(t => filter === 'all' || (filter === 'open' ? t.status === 'open' : t.status === filter));
-  const tray = sel ? trays.find(t => t.number === sel) : null;
-  const trayItems = tray ? items.filter(i => i.trayNumber === tray.number).sort((a, b) => a.code.localeCompare(b.code)) : [];
-  const trayOrders = tray ? orders.filter(o => tray.orderIds.includes(o.id)) : [];
-  const counts = { all: trays.length, open: trays.filter(t => t.status === 'open').length, packed: trays.filter(t => t.status === 'packed').length, shipped: trays.filter(t => t.status === 'shipped').length };
+  const a = agg(cur), b = agg(prev);
+  const rate = x => (x.busy ? Math.round(x.scans / (x.busy / 3600000)) : 0);
+  const delta = (n, o) => (o ? `<span class="${n >= o ? 'green' : 'red'} small">${n >= o ? '▲' : '▼'} ${Math.abs(Math.round(((n - o) / o) * 100))}% vs previous ${days} days</span>` : '<span class="muted small">No data for the previous period</span>');
+  const mt = Object.values(a.methods).reduce((x, y) => x + y, 0);
+  const sorted = all.slice().sort((x, y) => (y.date || '').localeCompare(x.date || '') || (y.createdAt || 0) - (x.createdAt || 0));
+  const pick = params.get('show') || (S.showId && db.getShow(S.showId) ? S.showId : sorted[0]?.id);
   view().innerHTML = `
-  <section class="panel">
-    <div class="row wrap between">
-      <h1>Trays</h1>
-      <div class="row wrap">
-        <button class="btn" id="dl-labels" ${trays.length ? '' : 'disabled'}>Shipping labels in tray order</button>
-        <button class="btn ghost" id="dl-slips" ${trays.length ? '' : 'disabled'}>Packing slips in tray order</button>
-        <button class="btn ghost" id="dl-traylabels" ${trays.length ? '' : 'disabled'}>Tray labels</button>
-      </div>
-    </div>
-    <div class="tabs">${['all', 'open', 'packed', 'shipped'].map(f => `<a href="#trays?f=${f}" class="${f === filter ? 'on' : ''}">${f[0].toUpperCase() + f.slice(1)} <span>${counts[f]}</span></a>`).join('')}</div>
+  <div class="row between wrap"><h1>Analytics</h1><div class="seg">${[30, 60, 90].map(d => `<a class="${d === days ? 'on' : ''}" href="#analytics?d=${d}${pick ? '&show=' + encodeURIComponent(pick) : ''}">${d} days</a>`).join('')}</div></div>
+  <div class="tiles three">
+    <div class="tile"><span class="label">Items scanned</span><b>${nf(a.scans)}</b>${delta(a.scans, b.scans)}</div>
+    <div class="tile"><span class="label">Per hour while scanning</span><b>${rate(a)}</b>${delta(rate(a), rate(b))}</div>
+    <div class="tile"><span class="label">Shows</span><b>${cur.length}</b><span class="muted small">${nf(a.items)} items sold</span></div>
+  </div>
+  <section class="panel"><h2>Your team</h2>
+    ${a.people.size ? `<div class="team-cards">${[...a.people.values()].sort((x, y) => (y.tray + y.box) - (x.tray + x.box)).map(p => `<div class="card person"><span class="avatar">${esc(p.name.slice(0, 2).toUpperCase())}</span><div><b>${esc(p.name)}</b><span class="muted small">${p.kind === 'packer' ? 'Packer login' : p.kind === 'phone' ? 'Named phone' : 'Your login'}</span></div>
+      <div class="pstats"><span><b>${nf(p.tray + p.box)}</b> items packed</span><span><b>${p.trayMs ? Math.round(p.tray / (p.trayMs / 3600000)) : 0}</b> into trays/hr</span><span><b>${p.boxMs ? Math.round(p.box / (p.boxMs / 3600000)) : 0}</b> into boxes/hr</span></div></div>`).join('')}</div>` : '<p class="muted">No scans in this period yet.</p>'}
+    <p class="muted small">Rates count only time spent scanning — gaps over 10 minutes are left out.</p></section>
+  <section class="panel"><h2>How items are scanned</h2>
+    ${mt ? Object.entries(a.methods).sort((x, y) => y[1] - x[1]).map(([k, n]) => `<div class="bar-line"><span>${METHOD_LABEL[k] || k}</span><span>${nf(n)} · ${pct(n, mt)}%</span></div><div class="bar"><i class="${k === 'camera' ? 'orange' : k === 'scanner' ? 'blue' : 'green'}" style="width:${pct(n, mt)}%"></i></div>`).join('') : '<p class="muted small">No scans yet.</p>'}
   </section>
-  ${tray ? `
-  <section class="panel tray-detail">
-    <div class="row between wrap">
-      <div><span class="tray-num xl">${tray.number}</span></div>
-      <div class="grow"><h2>${esc(tray.buyer)}</h2><p class="muted">${trayItems.length} items · ${tray.packedCount || 0} packed · ${trayOrders.length} order${trayOrders.length === 1 ? '' : 's'} · <span class="status ${tray.status}">${tray.status}</span></p></div>
-      <div class="col">
-        <a class="btn primary" href="#pack?t=${tray.number}">Pack this tray</a>
-        ${tray.status !== 'shipped' ? `<button class="btn ghost" data-act="ship">Mark shipped</button>` : `<button class="btn ghost" data-act="reopen">Reopen</button>`}
-        <a class="btn ghost" href="#trays?f=${filter}">Close</a>
-      </div>
-    </div>
-    <div class="table-wrap"><table><thead><tr><th>Sticker</th><th>Order</th><th>Status</th><th>Updated</th><th></th></tr></thead><tbody>
-      ${trayItems.map(i => `<tr><td class="code">${esc(i.code)}</td><td class="code small">${esc(i.orderId)}</td><td><span class="status ${i.status}">${i.status.replace('_', ' ')}</span></td><td class="small muted">${fmtDate(i.packedAt || i.scannedAt || i.createdAt)}</td>
-      <td><button class="btn tiny ghost danger" data-act="rm" data-id="${esc(i.id)}">Remove</button></td></tr>`).join('') || '<tr><td colspan="5" class="muted">No stickers matched to this tray. Add one below.</td></tr>'}
-    </tbody></table></div>
-    <form id="add-item" class="row wrap"><label class="grow">Add sticker to this tray<input id="add-code" placeholder="TOY0042" autocomplete="off"></label><button class="btn" type="submit">Add</button></form>
-  </section>` : ''}
-  <section class="tray-grid">
-    ${list.map(t => `<a class="tray-tile ${t.status} ${sel === t.number ? 'sel' : ''}" href="#trays?f=${filter}&t=${t.number}">
-      <span class="tray-num">${t.number}</span>
-      <span class="buyer">${esc(t.buyer)}</span>
-      <span class="small muted">${t.packedCount || 0}/${t.itemCount || 0} packed</span>
-      <span class="mini-bar"><i style="width:${t.itemCount ? Math.round((t.packedCount || 0) / t.itemCount * 100) : 0}%"></i></span>
-    </a>`).join('') || `<p class="muted pad">${trays.length ? 'No trays in this filter.' : 'No trays yet. Import the TikTok labels PDF after your show.'}</p>`}
-  </section>`;
-  const ordersById = Object.fromEntries(orders.map(o => [o.id, o]));
-  const filesById = async () => Object.fromEntries((await db.byIndex('files', 'showId', show.id)).map(f => [f.id, f]));
-  $('#dl-labels').onclick = async () => {
-    const { bytes, missing } = await reorderedLabelsPdf(trays, ordersById, await filesById());
-    if (!bytes) return toast('No shipping label pages were found in the imported PDFs.', 'error');
-    saveFile(bytes, `${slug(show.name)}-labels-tray-order.pdf`);
-    if (missing.length) toast(`No label for tray${missing.length > 1 ? 's' : ''} ${missing.slice(0, 12).map(t => t.number).join(', ')}${missing.length > 12 ? '…' : ''}`, 'warn');
-  };
-  $('#dl-slips').onclick = async () => {
-    const bytes = await reorderedSlipsPdf(trays, ordersById, await filesById());
-    if (!bytes) return toast('No packing slip pages were imported.', 'error');
-    saveFile(bytes, `${slug(show.name)}-slips-tray-order.pdf`);
-  };
-  $('#dl-traylabels').onclick = async () => saveFile(await trayLabelsPdf(trays, state.settings, show.name), `${slug(show.name)}-tray-labels.pdf`);
-  view().onclick = async e => {
-    const b = e.target.closest('[data-act]'); if (!b || !tray) return;
-    if (b.dataset.act === 'ship') { tray.status = 'shipped'; tray.shippedAt = Date.now(); await db.put('trays', tray); }
-    if (b.dataset.act === 'reopen') { tray.status = 'open'; await db.put('trays', tray); await refreshTrayStatus(show.id, tray.number); }
-    if (b.dataset.act === 'rm') { await db.del('items', b.dataset.id); await refreshTrayStatus(show.id, tray.number); }
-    viewTrays(params);
-  };
-  const add = $('#add-item');
-  if (add) add.onsubmit = async e => {
-    e.preventDefault();
-    const code = $('#add-code').value.trim().toUpperCase(); if (!code) return;
-    const exist = items.find(i => i.code === code);
-    if (exist) return toast(`${code} is already in tray ${exist.trayNumber}.`, 'error');
-    await db.put('items', { id: show.id + ':' + code, showId: show.id, code, trayNumber: tray.number, buyer: tray.buyer, orderId: trayOrders[0]?.orderId || '', status: 'sold', createdAt: Date.now() });
-    await refreshTrayStatus(show.id, tray.number);
-    viewTrays(params);
-  };
-}
-
-// ---------- Scanning (shared) ----------
-function scanBox(placeholder) {
-  return `<form class="scan-form" id="scan-form" autocomplete="off">
-    <input id="scan-input" class="scan-input" placeholder="${esc(placeholder)}" autocomplete="off" autocapitalize="characters" spellcheck="false" inputmode="text">
-    <button class="btn" type="submit">Enter</button>
-    <button class="btn ghost" type="button" id="cam-btn">Camera</button>
-  </form>
-  <div class="cam-wrap" id="cam-wrap" hidden><video id="cam-video" muted playsinline></video><div class="cam-line"></div></div>`;
-}
-function bindScanBox(onCode) {
-  const input = $('#scan-input');
-  const focus = () => { if (document.activeElement?.tagName !== 'INPUT' || document.activeElement === input) input.focus({ preventScroll: true }); };
-  focus();
-  $('#scan-form').onsubmit = e => { e.preventDefault(); const v = input.value.trim(); input.value = ''; if (v) onCode(v); };
-  $('#cam-btn').onclick = async () => {
-    if (state.camera) { stopCamera(); return; }
-    $('#cam-wrap').hidden = false;
-    state.camera = new CameraScanner($('#cam-video'), onCode);
-    try { await state.camera.start(); $('#cam-btn').textContent = 'Stop camera'; }
-    catch (err) { stopCamera(); toast(err.name === 'NotAllowedError' ? 'Camera permission was denied. Allow it in the browser settings.' : err.message, 'error'); }
-  };
-  view().onclick = e => { if (!e.target.closest('button,a,input,label,video')) focus(); };
-}
-function stopCamera() {
-  if (state.camera) state.camera.stop();
-  state.camera = null;
-  const w = $('#cam-wrap'); if (w) w.hidden = true;
-  const b = $('#cam-btn'); if (b) b.textContent = 'Camera';
-}
-function normalizeCode(raw) { return String(raw).trim().toUpperCase().replace(/\s+/g, ''); }
-
-// ---------- Scan to Tray ----------
-async function viewScan() {
-  const show = await currentShow();
-  if (!show) return needShow('Scan to tray');
-  const recent = (await db.byIndex('scans', 'showId', show.id)).filter(s => s.mode === 'tray').sort((a, b) => b.at - a.at).slice(0, 12);
-  view().innerHTML = `
-  <section class="panel scan-panel">
-    <h1>Scan to tray</h1>
-    <p class="muted">Scan each sticker. The tray number shows here and is read out loud.</p>
-    ${scanBox('Scan or type a sticker code')}
-    <div id="result" class="result idle"><span class="muted">Waiting for a scan</span></div>
-  </section>
-  <section class="panel"><h2>Recent scans</h2><ul class="recent" id="recent">${recent.map(recentRow).join('') || '<li class="muted">None yet</li>'}</ul></section>`;
-  bindScanBox(async raw => {
-    const code = normalizeCode(raw);
-    const items = await db.byIndex('items', 'code', code);
-    const it = items.find(i => i.showId === show.id);
-    const res = $('#result');
-    let result, tray = null;
-    if (!it) {
-      result = 'unknown';
-      res.className = 'result error';
-      res.innerHTML = `<span class="label">Not in this show</span><span class="big-code">${esc(code)}</span><span class="muted">This sticker isn't on any imported order. Check the import page, or add it to a tray by hand.</span>`;
-      feedback('error', state.settings, 'Not found');
-    } else {
-      tray = await refreshTrayStatus(show.id, it.trayNumber);
-      const already = it.status !== 'sold';
-      if (!already) { it.status = 'in_tray'; it.scannedAt = Date.now(); await db.put('items', it); tray = await refreshTrayStatus(show.id, it.trayNumber); }
-      result = already ? 'repeat' : 'ok';
-      res.className = 'result ' + (already ? 'warn' : 'ok');
-      res.innerHTML = `<span class="label">${already ? 'Already scanned · ' : ''}Tray</span><span class="tray-num huge">${it.trayNumber}</span>
-        <span class="buyer-big">${esc(it.buyer)}</span><span class="muted">${esc(code)} · ${tray.inTray} of ${tray.itemCount} items in tray</span>`;
-      feedback(already ? 'warn' : 'ok', state.settings, `Tray ${it.trayNumber}`);
-    }
-    await logScan(show.id, code, 'tray', result, it?.trayNumber);
-    const ul = $('#recent');
-    if (ul) { if (ul.querySelector('.muted')) ul.innerHTML = ''; ul.insertAdjacentHTML('afterbegin', recentRow({ code, result, trayNumber: it?.trayNumber, at: Date.now() })); }
-  });
-}
-function recentRow(s) {
-  const label = { ok: 'Tray ' + s.trayNumber, repeat: 'Repeat · tray ' + s.trayNumber, unknown: 'Not found', wrong: 'Wrong tray', packed: 'Packed · tray ' + s.trayNumber }[s.result] || s.result;
-  return `<li class="${s.result}"><span class="code">${esc(s.code)}</span><span>${esc(label)}</span><span class="muted small">${fmtDate(s.at)}</span></li>`;
-}
-
-// ---------- Scan to Box (pack) ----------
-async function viewPack(params) {
-  const show = await currentShow();
-  if (!show) return needShow('Pack');
-  const { trays, items } = await showData(show.id);
-  let trayNum = params.get('t') ? +params.get('t') : state.packTray;
-  let tray = trays.find(t => t.number === trayNum) || null;
-  state.packTray = tray ? tray.number : null;
-  const trayItems = tray ? items.filter(i => i.trayNumber === tray.number).sort((a, b) => a.code.localeCompare(b.code)) : [];
-  const nextOpen = trays.find(t => t.status === 'open' && (!tray || t.number > tray.number)) || trays.find(t => t.status === 'open' && (!tray || t.number !== tray.number));
-  view().innerHTML = `
-  <section class="panel scan-panel">
-    <h1>Pack</h1>
-    <p class="muted">${tray ? 'Scan each item as it goes in the box. Items from another buyer are flagged.' : 'Scan any item from a tray, or type a tray number, to start packing it.'}</p>
-    ${scanBox(tray ? 'Scan an item going into the box' : 'Scan an item or type a tray number')}
-    <div id="result" class="result idle"><span class="muted">${tray ? 'Packing tray ' + tray.number : 'No tray open'}</span></div>
-  </section>
-  ${tray ? `<section class="panel">
-    <div class="row between wrap">
-      <div class="row"><span class="tray-num xl">${tray.number}</span><div><h2>${esc(tray.buyer)}</h2><p class="muted" id="pack-count">${trayItems.filter(i => i.status === 'packed').length} of ${trayItems.length} packed</p></div></div>
-      <div class="row wrap">
-        <button class="btn ghost" id="pack-all">Mark all packed</button>
-        ${nextOpen ? `<a class="btn" href="#pack?t=${nextOpen.number}">Next tray (${nextOpen.number})</a>` : ''}
-      </div>
-    </div>
-    <ul class="checklist">${trayItems.map(i => `<li class="${i.status === 'packed' ? 'done' : ''}" data-code="${esc(i.code)}"><span class="box"></span><span class="code">${esc(i.code)}</span><span class="muted small">${esc(i.orderId)}</span></li>`).join('') || '<li class="muted">No stickers matched to this tray.</li>'}</ul>
-  </section>` : ''}`;
-  const openTray = n => { location.hash = '#pack?t=' + n; };
-  bindScanBox(async raw => {
-    const code = normalizeCode(raw);
-    const res = $('#result');
-    if (/^\d{1,4}$/.test(code) && trays.some(t => t.number === +code)) { openTray(+code); return; }
-    const it = (await db.byIndex('items', 'code', code)).find(i => i.showId === show.id);
-    if (!it) {
-      res.className = 'result error';
-      res.innerHTML = `<span class="label">Not in this show</span><span class="big-code">${esc(code)}</span>`;
-      feedback('error', state.settings, 'Not found');
-      await logScan(show.id, code, 'pack', 'unknown');
-      return;
-    }
-    if (!tray) { openTray(it.trayNumber); return; }
-    if (it.trayNumber !== tray.number) {
-      res.className = 'result error';
-      res.innerHTML = `<span class="label">Wrong buyer</span><span class="big-code">${esc(code)}</span><span class="buyer-big">Belongs in tray ${it.trayNumber} · ${esc(it.buyer)}</span>`;
-      feedback('error', state.settings, `Wrong buyer. Tray ${it.trayNumber}`);
-      await logScan(show.id, code, 'pack', 'wrong', it.trayNumber);
-      return;
-    }
-    const was = it.status === 'packed';
-    it.status = 'packed'; it.packedAt = it.packedAt || Date.now(); it.scannedAt = it.scannedAt || Date.now();
-    await db.put('items', it);
-    const t = await refreshTrayStatus(show.id, tray.number);
-    await logScan(show.id, code, 'pack', was ? 'repeat' : 'packed', tray.number);
-    const li = view().querySelector(`li[data-code="${CSS.escape(code)}"]`); if (li) li.classList.add('done');
-    $('#pack-count').textContent = `${t.packedCount} of ${t.itemCount} packed`;
-    if (t.packedCount === t.itemCount) {
-      res.className = 'result ok';
-      res.innerHTML = `<span class="label">Tray complete</span><span class="tray-num huge">${tray.number}</span><span class="buyer-big">${esc(tray.buyer)} · seal the box</span>`;
-      feedback('done', state.settings, `Tray ${tray.number} complete`);
-    } else {
-      res.className = 'result ' + (was ? 'warn' : 'ok');
-      res.innerHTML = `<span class="label">${was ? 'Already packed' : 'Packed'}</span><span class="big-code">${esc(code)}</span><span class="muted">${t.itemCount - t.packedCount} left for ${esc(tray.buyer)}</span>`;
-      feedback(was ? 'warn' : 'ok', state.settings, was ? 'Already packed' : String(t.itemCount - t.packedCount) + ' left');
-    }
-  });
-  const pa = $('#pack-all');
-  if (pa) pa.onclick = async () => {
-    if (pa.dataset.confirm !== '1') { pa.dataset.confirm = '1'; pa.textContent = 'Tap again to confirm'; return; }
-    for (const i of trayItems) if (i.status !== 'packed') { i.status = 'packed'; i.packedAt = Date.now(); await db.put('items', i); }
-    await refreshTrayStatus(show.id, tray.number);
-    feedback('done', state.settings, `Tray ${tray.number} complete`);
-    viewPack(params);
-  };
-}
-
-// ---------- History ----------
-async function viewHistory(params) {
-  const q = (params.get('q') || '').trim();
-  const shows = await db.all('shows');
-  const showName = Object.fromEntries(shows.map(s => [s.id, s.name]));
-  let results = [];
-  if (q) {
-    const ql = q.toLowerCase(), qk = buyerKey(q);
-    const [items, trays] = await Promise.all([db.all('items'), db.all('trays')]);
-    const trayBy = new Map(trays.map(t => [t.showId + ':' + t.number, t]));
-    results = items.filter(i => i.code.toLowerCase().includes(ql) || String(i.orderId).includes(q) || (qk && buyerKey(i.buyer).includes(qk)))
-      .map(i => ({ ...i, tray: trayBy.get(i.showId + ':' + i.trayNumber) }))
-      .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)).slice(0, 300);
+  <section class="panel"><div class="row between wrap"><h2>By show</h2>
+    <select id="an-show">${sorted.map(s => `<option value="${esc(s.id)}" ${s.id === pick ? 'selected' : ''}>${esc(s.name)} · ${fmtDateStr(s.date)}</option>`).join('')}</select></div>
+    <div id="an-report">${pick ? '<p class="muted">Loading…</p>' : '<p class="muted">No shows yet.</p>'}</div></section>`;
+  const sel = $('#an-show');
+  if (sel) sel.onchange = () => { location.hash = `#analytics?d=${days}&show=${encodeURIComponent(sel.value)}&keep=1`; };
+  if (pick) {
+    const s = db.getShow(pick);
+    const data = await db.showData(pick);
+    const evs = await db.showEvents(pick);
+    const el = $('#an-report'); if (!el) return;
+    el.innerHTML = `<p class="small"><a href="#show/${esc(pick)}/overview">Open this show →</a></p>` + showReport(s, buildState(data, evs));
   }
-  view().innerHTML = `
-  <section class="panel">
-    <h1>History</h1>
-    <form id="hist-form" class="row"><input id="hist-q" class="grow" value="${esc(q)}" placeholder="Search buyer, order ID or sticker code"><button class="btn primary">Search</button></form>
-  </section>
-  ${q ? `<section class="panel"><p class="muted">${results.length} result${results.length === 1 ? '' : 's'}${results.length === 300 ? ' (first 300)' : ''}</p>
-  <div class="table-wrap"><table><thead><tr><th>Sticker</th><th>Buyer</th><th>Show</th><th>Tray</th><th>Order</th><th>Status</th><th>Packed</th></tr></thead><tbody>
-  ${results.map(r => `<tr><td class="code">${esc(r.code)}</td><td>${esc(r.buyer)}</td><td>${esc(showName[r.showId] || '')}</td><td>${r.trayNumber}</td><td class="code small">${esc(r.orderId)}</td>
-    <td><span class="status ${r.tray?.status === 'shipped' ? 'shipped' : r.status}">${r.tray?.status === 'shipped' ? 'shipped' : r.status.replace('_', ' ')}</span></td><td class="small muted">${fmtDate(r.packedAt)}</td></tr>`).join('')}
-  </tbody></table></div></section>` : ''}`;
-  $('#hist-form').onsubmit = e => { e.preventDefault(); location.hash = '#history?q=' + encodeURIComponent($('#hist-q').value.trim()); };
 }
 
-// ---------- Settings / data ----------
-async function viewSettings() {
-  const s = state.settings;
-  const show = await currentShow();
+// ================= Team =================
+function viewTeam() {
+  const t = db.team();
+  const code = t?.code || '…';
+  const link = `${appUrl()}?join=${encodeURIComponent(code)}`;
+  const mem = db.members().sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+  const reqs = mem.filter(m => m.status === 'pending');
+  const packers = mem.filter(m => m.status !== 'pending');
+  const stats = new Map();
+  const since = Date.now() - 30 * 864e5;
+  db.shows().filter(s => (s.sum?.last || 0) >= since).forEach(s => (s.sum.people || []).forEach(p => {
+    const x = stats.get(p.key) || { name: p.name, kind: p.kind, n: 0, ms: 0, last: 0 };
+    x.n += (p.tray || 0) + (p.box || 0); x.ms += p.busy || 0; x.last = Math.max(x.last, s.sum.last || 0);
+    stats.set(p.key, x);
+  }));
+  const own = [...stats.entries()].filter(([k]) => !k.startsWith('packer:'));
   view().innerHTML = `
-  <section class="panel">
-    <h1>Settings</h1>
-    <form id="set-form" class="grid-form">
-      <label>Label width (mm)<input id="s-w" type="number" min="25" max="150" value="${s.labelWidthMm}"></label>
-      <label>Label height (mm)<input id="s-h" type="number" min="15" max="150" value="${s.labelHeightMm}"></label>
-      <label class="check"><input id="s-voice" type="checkbox" ${s.voice ? 'checked' : ''}> Read tray numbers out loud</label>
-      <label class="check"><input id="s-sounds" type="checkbox" ${s.sounds ? 'checked' : ''}> Beeps</label>
-      <label class="check"><input id="s-vib" type="checkbox" ${s.vibrate ? 'checked' : ''}> Vibrate (phones)</label>
-      <label class="wide">Extra sticker pattern (advanced, optional)<input id="s-re" value="${esc(s.stickerRegex)}" placeholder="e.g. Lot\\s*(\\d+)"><span class="muted small">A regular expression whose first group is the sticker number, for listings named another way.</span></label>
-      <button class="btn primary" type="submit">Save settings</button>
-    </form>
+  <h1>Team</h1>
+  <p class="muted">Packers join with your team code — no passwords. They can only scan and pack: no imports, labels, billing or settings.</p>
+  <div class="ov-grid">
+  <div>
+    ${reqs.length ? `<section class="panel attention"><h2>Waiting for approval (${reqs.length})</h2><ul class="mem-list">${reqs.map(m => `<li><span class="avatar">${esc(m.name.slice(0, 2).toUpperCase())}</span><div class="grow"><b>${esc(m.name)}</b><div class="muted small">Asked ${ago(m.createdAt)}</div></div>
+      <button class="btn primary small" data-ok="${esc(m.uid)}">Approve</button><button class="btn ghost small" data-no="${esc(m.uid)}">Decline</button></li>`).join('')}</ul></section>` : ''}
+    <section class="panel"><h2>Packers</h2>
+      ${packers.length ? `<ul class="mem-list">${packers.map(m => { const x = stats.get('packer:' + m.name) || { n: 0, ms: 0, last: 0 }; return `<li class="${m.status === 'deactivated' ? 'off' : ''}"><span class="avatar">${esc(m.name.slice(0, 2).toUpperCase())}</span>
+        <div class="grow"><b>${esc(m.name)}</b>${m.status === 'deactivated' ? ' <span class="pill">Deactivated</span>' : ''}<div class="muted small">${nf(x.n)} scans · ${x.ms ? Math.round(x.n / (x.ms / 3600000)) : 0} per hour · last active ${x.last ? ago(x.last) : 'never'} (30 days)</div></div>
+        ${m.status === 'deactivated' ? `<button class="btn small" data-re="${esc(m.uid)}">Reactivate</button><button class="btn ghost small" data-rm="${esc(m.uid)}">Remove</button>` : `<button class="btn ghost small" data-off="${esc(m.uid)}">Deactivate</button>`}</li>`; }).join('')}</ul>` : '<p class="muted">No packers yet. Share your team code to invite one.</p>'}
+    </section>
+    <section class="panel"><h2>Scanning on your own login</h2><p class="muted small">Phones signed in with your owner login, by the name set in each phone's Settings → This device's name.</p>
+      ${own.length ? `<ul class="mem-list">${own.map(([k, x]) => `<li><span class="avatar">${esc(x.name.slice(0, 2).toUpperCase())}</span><div class="grow"><b>${esc(x.name)}</b><div class="muted small">${x.kind === 'phone' ? 'Named phone' : 'Unnamed device'} · ${nf(x.n)} scans · ${x.ms ? Math.round(x.n / (x.ms / 3600000)) : 0} per hour · last active ${ago(x.last)}</div></div></li>`).join('')}</ul>` : '<p class="muted small">No scans on your own login in the last 30 days.</p>'}
+    </section>
+  </div>
+  <aside><section class="panel invite"><h2>Invite a packer</h2>
+    <p class="muted small">They scan this with their phone camera, type their name and tap Join. You approve them here.</p>
+    <div class="qr-card">${qrSvg(link, 200)}</div>
+    <p class="center">Team code <b class="code big">${esc(code)}</b></p>
+    <div class="row wrap center"><button class="btn" id="copy">Copy invite</button><a class="btn" target="_blank" rel="noopener" href="https://wa.me/?text=${encodeURIComponent('Join my packing team on ShopOps Pack: ' + link + '  (team code ' + code + ')')}">Share on WhatsApp</a></div>
+    <button class="btn ghost small" id="change">Change code</button>
+    <p class="muted small">Changing the code stops new people joining with the old one. People already on the team stay.</p>
+  </section></aside></div>`;
+  $$('[data-ok]').forEach(b => { b.onclick = () => db.setMember(b.dataset.ok, { status: 'active', approvedAt: Date.now() }).then(() => toast('Approved', 'ok')); });
+  $$('[data-no]').forEach(b => { b.onclick = () => db.removeMember(b.dataset.no); });
+  $$('[data-off]').forEach(b => confirmTap(b, 'Tap again to deactivate', () => db.setMember(b.dataset.off, { status: 'deactivated' })));
+  $$('[data-re]').forEach(b => { b.onclick = () => db.setMember(b.dataset.re, { status: 'active' }); });
+  $$('[data-rm]').forEach(b => confirmTap(b, 'Tap again to remove', () => db.removeMember(b.dataset.rm)));
+  $('#copy').onclick = async () => { try { await navigator.clipboard.writeText(`Join my packing team on ShopOps Pack: ${link} (team code ${code})`); toast('Invite copied', 'ok'); } catch (e) { toast(link); } };
+  const ch = $('#change'); confirmTap(ch, 'Tap again to make a new code', async () => { await db.changeTeamCode(OWNER_NAME); viewTeam(); });
+}
+
+// ================= Settings =================
+function viewSettings() {
+  const st = S.settings, p = prefs();
+  const tog = (id, on, label, sub) => `<label class="toggle"><span><b>${label}</b>${sub ? `<span class="muted small">${sub}</span>` : ''}</span><input type="checkbox" id="${id}" ${on ? 'checked' : ''}><i></i></label>`;
+  view().innerHTML = `
+  <h1>Settings</h1>
+  ${S.owner ? `<section class="panel"><h2>Packing</h2>
+    <label>Packing mode<select id="p-mode"><option value="post" selected>Post-show — sort everything after the live</option><option value="live" disabled>Live — trays as items sell (needs a live sales feed; TikTok doesn't share one)</option></select></label>
+    <label>Items per tray (most)<input type="number" id="p-per" min="4" max="100" value="${p.perTray}"></label>
+    <span class="muted small">A buyer with more items gets more than one tray. Applies to shows imported from now on.</span>
+    ${tog('p-count', p.itemCount, 'Show item count on labels', 'Stamps "N items" next to the tray number on shipping labels.')}
+    ${tog('p-hide', p.hideRevenue, 'Hide show revenue', 'Hides sales amounts on every screen — handy when packers look at the screen.')}
+  </section>` : ''}
+  <section class="panel"><h2>This device</h2>
+    <label>This device's name<input id="d-name" maxlength="30" value="${esc(st.deviceName)}" placeholder="${S.owner ? 'e.g. Packing table phone' : esc(S.me?.name || '')}" ${S.owner ? '' : 'disabled'}></label>
+    <span class="muted small">${S.owner ? "Scans from this device show under this name in Scan history, Analytics and Team." : 'Your scans show under your name.'}</span>
+    ${tog('d-scanner', st.scannerMode, 'Dedicated scanner mode', 'For Android scanner phones with a trigger button (Chainway, Zebra, Honeywell, Urovo…). Turns the camera button off and keeps the scan box ready so every trigger press lands in it. The on-screen keyboard stays hidden.')}
+    <details class="small"><summary>Setting up a scanner phone</summary><ol class="steps-list">
+      <li>Open the scanner's own settings app (Chainway: <b>Keyboard emulator</b> / <b>KeyboardEmulator</b>; Zebra: <b>DataWedge</b>; Honeywell: <b>Scan settings</b>).</li>
+      <li>Set output mode to <b>Keyboard</b> (also called "keystroke", "simulate keyboard" or "keyboard wedge").</li>
+      <li>Set the suffix / end character to <b>Enter</b> (sometimes "\\n" or "CR+LF").</li>
+      <li>Make sure <b>Code 128</b> is switched on (stickers) along with the usual shipping-label codes.</li>
+      <li>Here, turn on <b>Dedicated scanner mode</b>, open Scan to Tray and press the trigger.</li></ol>
+      <p class="muted">USB and Bluetooth hand scanners work the same way on a computer — no setting needed.</p></details>
+    ${tog('d-sounds', st.sounds, 'Sounds', 'Beep for good scans, buzz for problems.')}
+    ${tog('d-voice', st.voice, 'Say the tray number out loud')}
+    ${tog('d-vibrate', st.vibrate, 'Vibrate on problems')}
+    <div class="grid2"><label>Sticker width (mm)<input type="number" id="d-w" min="20" max="120" value="${st.labelWidthMm}"></label><label>Sticker height (mm)<input type="number" id="d-h" min="10" max="120" value="${st.labelHeightMm}"></label></div>
   </section>
-  <section class="panel">
-    <h2>Data</h2>
-    <p class="muted">Everything is stored on this device only. Back up regularly, and restore the backup on another device to move your data.</p>
-    <div class="row wrap">
-      ${show ? `<button class="btn" id="csv">Export "${esc(show.name)}" as CSV</button>` : ''}
-      <button class="btn" id="backup">Download backup</button>
-      <label class="btn ghost file-btn">Restore backup<input id="restore" type="file" accept=".json,application/json"></label>
-    </div>
-    <p class="muted small">Restoring adds the backup's shows to the team data. It never deletes anything.</p>
-  </section>
-  <section class="panel">
-    <h2>Team login</h2>
-    <p class="muted">Signed in as <b>${esc(db.currentUser()?.email || '')}</b>. Everything syncs live to every device signed in to this login.</p>
-    <button class="btn ghost" id="signout">Sign out of this device</button>
-  </section>
-  <section class="panel">
-    <h2>Install</h2>
-    <p class="muted">On Android, open the menu in Chrome and choose <b>Install app</b> or <b>Add to Home screen</b>. On a computer, use the install icon at the right of Chrome's or Edge's address bar.</p>
-    <button class="btn" id="install-btn" ${window.__installPrompt ? '' : 'hidden'}>Install ShopOps Pack</button>
-  </section>`;
-  $('#set-form').onsubmit = async e => {
-    e.preventDefault();
-    const re = $('#s-re').value.trim();
-    if (re) { try { new RegExp(re); } catch (err) { return toast('The sticker pattern is not a valid regular expression.', 'error'); } }
-    state.settings = { ...s, labelWidthMm: +$('#s-w').value || 50, labelHeightMm: +$('#s-h').value || 25, voice: $('#s-voice').checked, sounds: $('#s-sounds').checked, vibrate: $('#s-vib').checked, stickerRegex: re };
-    await db.saveSettings(state.settings);
-    toast('Settings saved', 'ok');
-  };
-  const csvBtn = $('#csv');
-  if (csvBtn) csvBtn.onclick = async () => {
-    const { items, trays } = await showData(show.id);
-    const tb = new Map(trays.map(t => [t.number, t]));
-    const rows = [['Tray', 'Buyer', 'Sticker', 'Order ID', 'Item status', 'Tray status', 'Scanned', 'Packed']];
-    items.sort((a, b) => a.trayNumber - b.trayNumber || a.code.localeCompare(b.code)).forEach(i => rows.push([i.trayNumber, i.buyer, i.code, i.orderId, i.status, tb.get(i.trayNumber)?.status || '', i.scannedAt ? new Date(i.scannedAt).toISOString() : '', i.packedAt ? new Date(i.packedAt).toISOString() : '']));
-    const csv = rows.map(r => r.map(v => { const s = String(v ?? ''); return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; }).join(',')).join('\r\n');
-    saveFile(new TextEncoder().encode('﻿' + csv), `${slug(show.name)}.csv`, 'text/csv');
-  };
-  $('#backup').onclick = async () => {
-    const data = await db.exportBackup();
-    saveFile(new TextEncoder().encode(JSON.stringify(data)), `shopops-pack-backup-${new Date().toISOString().slice(0, 10)}.json`, 'application/json');
-  };
-  $('#restore').onchange = async e => {
-    const f = e.target.files[0]; if (!f) return;
-    try {
-      await db.importBackup(JSON.parse(await readText(f)));
-      state.settings = await db.getSettings();
-      await updateShowLabel();
-      toast('Backup added to the team data', 'ok'); location.hash = '#shows';
-    } catch (err) { toast(err.message, 'error'); }
-  };
+  ${S.owner ? `<section class="panel"><h2>Sign in on your phone</h2><p class="muted small">Scan with your phone camera to open the app, then sign in with your owner login. Packers use the Team page instead.</p>
+    <div class="qr-card small-qr">${qrSvg(appUrl(), 150)}</div>
+    <p class="small"><a href="https://github.com/jcsgotdeals-lab/shopops-pack/releases/latest/download/ShopOps-Pack.apk">Download the Android app (APK)</a></p></section>` : ''}
+  <section class="panel"><h2>Account</h2>
+    <p>${S.owner ? `Signed in as <b>${esc(S.user.email)}</b> (owner)` : `Packing as <b>${esc(S.me?.name || '')}</b> on your team`}</p>
+    ${window.__installPrompt ? '<button class="btn" id="install">Install app on this device</button>' : ''}
+    <button class="btn ghost" id="signout">Sign out</button>
+    <p class="muted small">ShopOps Pack ${APP_VERSION}</p></section>`;
+  const saveLocal = () => { db.saveLocalSettings(S.settings); };
+  const bindTog = (id, key) => { const el = $('#' + id); if (el) el.onchange = () => { S.settings[key] = el.checked; saveLocal(); toast('Saved', 'ok'); }; };
+  bindTog('d-scanner', 'scannerMode'); bindTog('d-sounds', 'sounds'); bindTog('d-voice', 'voice'); bindTog('d-vibrate', 'vibrate');
+  const dn = $('#d-name');
+  if (dn && S.owner) dn.onchange = () => { S.settings.deviceName = dn.value.trim(); saveLocal(); const nm = S.settings.deviceName; db.setDevice({ id: db.deviceId(), who: nm || 'You', whoKind: nm ? 'phone' : 'owner' }); $('#who').textContent = nm || 'Owner'; toast('Saved', 'ok'); };
+  const num = (id, key) => { const el = $('#' + id); el.onchange = () => { const v = parseInt(el.value, 10); if (v >= 10) { S.settings[key] = v; saveLocal(); toast('Saved', 'ok'); } }; };
+  num('d-w', 'labelWidthMm'); num('d-h', 'labelHeightMm');
+  if (S.owner) {
+    $('#p-per').onchange = e => { const v = parseInt(e.target.value, 10); if (v >= 4 && v <= 100) db.savePrefs({ perTray: v }).then(() => toast('Saved', 'ok')); };
+    $('#p-count').onchange = e => db.savePrefs({ itemCount: e.target.checked }).then(() => toast('Saved', 'ok'));
+    $('#p-hide').onchange = e => db.savePrefs({ hideRevenue: e.target.checked }).then(() => toast('Saved', 'ok'));
+  }
+  const ins = $('#install'); if (ins) ins.onclick = () => window.__installPrompt.prompt();
   $('#signout').onclick = () => db.signOut();
-  const ib = $('#install-btn');
-  if (ib) ib.onclick = async () => { const p = window.__installPrompt; if (!p) return; p.prompt(); await p.userChoice; window.__installPrompt = null; ib.hidden = true; };
 }
 
-// ---------- Router ----------
-const routes = { shows: viewShows, stickers: viewStickers, import: viewImport, trays: viewTrays, scan: viewScan, pack: viewPack, history: viewHistory, settings: viewSettings };
-const routeName = () => (location.hash.slice(1) || (state.showId ? 'trays' : 'shows')).split('?')[0];
-// When another phone or computer changes something, redraw screens that just display data.
-// Scan, Pack and Import are left alone so a scan in progress is never interrupted.
-const LIVE_VIEWS = ['shows', 'stickers', 'trays', 'history'];
-async function liveRefresh() {
-  await updateShowLabel();
-  const name = routeName();
-  if (!LIVE_VIEWS.includes(name)) return;
-  const a = document.activeElement;
-  if (a && view().contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName)) return; // someone is typing
-  const y = window.scrollY;
-  const [, qs] = (location.hash.slice(1) || name).split('?');
-  try { await routes[name](new URLSearchParams(qs || '')); window.scrollTo(0, y); } catch (err) { console.error(err); }
-}
-async function route() {
-  stopCamera();
-  view().onclick = null;
-  const [name, qs] = (location.hash.slice(1) || (state.showId ? 'trays' : 'shows')).split('?');
-  const fn = routes[name] || viewShows;
-  document.querySelectorAll('nav a').forEach(a => a.classList.toggle('on', a.getAttribute('href') === '#' + name));
-  try { await fn(new URLSearchParams(qs || '')); }
-  catch (err) { console.error(err); view().innerHTML = `<section class="panel"><h1>Something went wrong</h1><p>${esc(err.message)}</p></section>`; }
-  window.scrollTo(0, 0);
-}
-
-// ---------- Team sign-in ----------
-function viewSignIn() {
-  document.body.classList.add('signed-out');
+// ================= Help =================
+function viewHelp() {
+  const q = (title, body) => `<details class="faq"><summary>${title}</summary><div>${body}</div></details>`;
   view().innerHTML = `
-  <section class="panel signin">
-    <h1>Sign in</h1>
-    <p class="muted">Use your team's ShopOps Pack login. Every phone and computer signed in to it sees the same shows, trays and scans, live.</p>
-    <form id="signin-form" class="stack">
-      <label>Email<input id="si-email" type="email" autocomplete="username" required></label>
-      <label>Password<input id="si-pass" type="password" autocomplete="current-password" required minlength="6"></label>
-      <button class="btn primary" id="si-go">Sign in</button>
-    </form>
-    <p class="muted small" id="si-msg"></p>
-    <details class="small"><summary>First time setting up your team?</summary>
-      <p class="muted">Create the team login once, then sign in with it on every device.</p>
-      <button class="btn" id="si-create" type="button">Create team login</button>
-    </details>
-  </section>`;
-  const msg = t => { $('#si-msg').textContent = t; };
-  const friendly = err => ({
-    'auth/invalid-credential': 'Wrong email or password.', 'auth/wrong-password': 'Wrong email or password.',
-    'auth/user-not-found': 'Wrong email or password.', 'auth/invalid-email': 'That email address doesn\'t look right.',
-    'auth/email-already-in-use': 'A team login with that email already exists. Sign in instead.',
-    'auth/weak-password': 'Use a password with at least 6 characters.', 'auth/network-request-failed': 'No internet connection. Connect and try again.',
-    'auth/operation-not-allowed': 'New team logins are turned off. Sign in with your existing team login.',
-    'auth/admin-restricted-operation': 'New team logins are turned off. Sign in with your existing team login.',
-  }[err.code] || err.message);
-  $('#signin-form').onsubmit = async e => {
-    e.preventDefault(); msg('Signing in…');
-    try { await db.signIn($('#si-email').value, $('#si-pass').value); location.reload(); } catch (err) { msg(friendly(err)); }
-  };
-  $('#si-create').onclick = async () => {
-    if (!$('#signin-form').reportValidity()) return;
-    msg('Creating team login…');
-    try { await db.createTeam($('#si-email').value, $('#si-pass').value); location.reload(); } catch (err) { msg(friendly(err)); }
-  };
+  <h1>Help</h1>
+  <div class="ov-grid"><div>
+  <section class="panel"><h2>How a show goes</h2><ol class="steps-list">
+    <li><b>Before the live:</b> Pre-Show Labels → print numbered stickers for your listing name.</li>
+    <li><b>During the live:</b> stick the next number on each item as it sells.</li>
+    <li><b>After the live:</b> download the labels + packing slips PDF from TikTok Seller Center and import it (Shows → Pack a finished show).</li>
+    <li><b>Sort into trays:</b> scan each sticker. The screen shows a big tray number and the buyer. Biggest buyer = Tray 1.</li>
+    <li><b>Print labels:</b> Pack &amp; ship → Labels. Pages come out in tray order with the tray number stamped on.</li>
+    <li><b>Pack boxes:</b> scan an item to open its box, scan each item in, then scan the postage label — it tells you if anything is missing.</li>
+    <li><b>Hand over:</b> scan each parcel as it goes in the courier's sack.</li></ol></section>
+  <section class="panel"><h2>Questions</h2>
+    ${q('A sticker says "Not in this show"', 'Check you picked the right show (tap the show name), and that the listing name on the sticker matches the one in TikTok. You can also type just the number and press Enter.')}
+    ${q('"More than one match"', 'Two listing names used the same number. Scan the barcode instead of typing, so the name is included.')}
+    ${q('An item is damaged, missing or cancelled', 'Open the tray, tap ⋯ next to the item and pick Mark as damaged / missing / on the floor / cancelled. Cancelled items no longer count towards the tray.')}
+    ${q('I scanned the wrong thing', 'Tap Undo. It takes back your last scan on this device. On the computer, ▾ next to Undo can reset every tray in the show.')}
+    ${q('Does it work without internet?', 'Yes. Scans are saved on the device and sync to everyone as soon as the connection is back.')}
+    ${q('Using a scanner phone (Chainway, Zebra, Honeywell)', 'Set the scanner to keyboard output with an Enter suffix, then turn on Settings → Dedicated scanner mode. Full steps are on the Settings page.')}
+    ${q('Adding packers', S.owner ? 'Team → Invite a packer. They scan the QR code, type their name and tap Join; you tap Approve.' : 'Ask the owner for the team code.')}
+  </section></div>
+  <aside><section class="panel"><h2>Install the app</h2>
+    <p><b>Android phone:</b> <a href="https://github.com/jcsgotdeals-lab/shopops-pack/releases/latest/download/ShopOps-Pack.apk">download the APK</a> and open it (allow "install unknown apps" if asked). Or open this page in Chrome → ⋮ → Install app.</p>
+    <p><b>iPhone:</b> open this page in Safari → Share → Add to Home Screen.</p>
+    <p><b>Computer:</b> open this page in Chrome or Edge → the install icon in the address bar.</p>
+  </section></aside></div>`;
 }
 
-async function boot() {
-  if ('serviceWorker' in navigator && location.protocol !== 'file:') navigator.serviceWorker.register('./sw.js').catch(() => {});
-  const user = await db.waitForUser();
-  if (!user) { viewSignIn(); return; }
-  await db.start();
-  db.onRemoteChange(liveRefresh);
-  let lastErr = 0;
-  db.onError(err => {
-    if (Date.now() - lastErr < 10000) return; lastErr = Date.now();
-    toast(err && err.code === 'permission-denied' ? 'This login no longer has access to the team data. Sign out and sign in again.' : 'Sync problem: ' + (err.message || err), 'error');
-  });
-  state.settings = await db.getSettings();
-  let saved = null; try { saved = localStorage.getItem('currentShow'); } catch (e) { /* ignore */ }
-  if (saved && await db.get('shows', saved)) state.showId = saved;
-  await updateShowLabel();
-  window.addEventListener('hashchange', route);
-  window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); window.__installPrompt = e; });
-  route();
-}
 boot();
