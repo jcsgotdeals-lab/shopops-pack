@@ -1,0 +1,6 @@
+{
+  "appId": "com.shopops.pack",
+  "appName": "ShopOps Pack",
+  "webDir": "app",
+  "android": { "allowMixedContent": false }
+}
