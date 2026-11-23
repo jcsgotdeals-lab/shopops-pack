@@ -296,11 +296,10 @@ function viewImport() {
   if (pending) drawPreview();
 }
 function drawPreview() {
-  const p = pending, per = prefs().perTray;
-  const plan = planShow(p.parsed.orders, per);
+  const p = pending;
+  const plan = planShow(p.parsed.orders);
   const noNum = p.parsed.orders.filter(o => !o.items.length);
   const withLabel = p.parsed.orders.filter(o => o.labelPages.length).length;
-  const split = new Set(plan.trays.filter(t => t.part > 0).map(t => t.buyerKey)).size;
   const buyers = new Set(plan.trays.map(t => t.buyerKey)).size;
   $('#preview').innerHTML = `<section class="panel">
     <h2>Check before creating trays</h2>
@@ -308,7 +307,7 @@ function drawPreview() {
     ${noNum.length ? `<p class="notice">${noNum.length} order${noNum.length === 1 ? '' : 's'} had no sticker number (#…) on the slip. They still get a tray; tick them off by hand.</p>` : ''}
     ${withLabel < p.parsed.orders.length && p.parsed.labelPages ? `<p class="notice">${p.parsed.orders.length - withLabel} order${p.parsed.orders.length - withLabel === 1 ? '' : 's'} had no shipping label in the PDF.</p>` : ''}
     ${!p.parsed.labelPages && p.files.length ? '<p class="notice">Packing slips only — add the shipping labels later on the show\'s Labels step.</p>' : ''}
-    ${split ? `<p class="muted small">${split} buyer${split === 1 ? '' : 's'} bought more than ${per} items, so they get more than one tray.</p>` : ''}
+    ${plan.trays.length > buyers ? `<p class="muted small">${plan.trays.length - buyers} buyer${plan.trays.length - buyers === 1 ? ' has' : 's have'} more than one package, so they get one tray per package (each package has its own label).</p>` : ''}
     <div class="grid2"><label>Show name<input id="pv-name" value="${esc(p.name)}"></label><label>Show date<input id="pv-date" type="date" value="${esc(p.date)}"></label></div>
     <details><summary>See the trays (${plan.trays.length})</summary><div class="table-wrap"><table class="tbl"><thead><tr><th>Tray</th><th>Buyer</th><th>Items</th><th>Stickers</th></tr></thead><tbody>
       ${plan.trays.map(t => `<tr><td><b>${t.n}</b></td><td>${esc(at(t.buyer))}${t.part ? ' <span class="muted small">(part ' + (t.part + 1) + ')</span>' : ''}</td><td>${t.items.length}</td><td class="small">${t.items.map(id => plan.items.find(i => i.id === id)).map(i => (i.num != null ? '#' + i.num : '—')).join(', ')}</td></tr>`).join('')}
@@ -322,7 +321,7 @@ function drawPreview() {
     const id = db.uid('show');
     const show = {
       id, name: (p.name || '').trim() || 'Show', date: p.date || today(), platform: p.platform, createdAt: Date.now(),
-      trayCount: plan.trays.length, itemCount: plan.items.length, hasLabels: plan.orders.some(o => o.labelPages.length), noNumber: noNum.length, perTray: per,
+      trayCount: plan.trays.length, itemCount: plan.items.length, hasLabels: plan.orders.some(o => o.labelPages.length), noNumber: noNum.length,
     };
     await db.createShow(show, plan, p.files.map(f => ({ ...f, showId: id })));
     pending = null; setShowId(id);
@@ -336,16 +335,15 @@ async function makeSample() {
   const weights = [9, 7, 6, 5, 5, 4, 4, 3, 3, 3, 2, 2, 2, 1, 1];
   const orders = []; let num = 1;
   names.forEach((b, bi) => {
-    for (let k = 0; k < weights[bi]; k++) {
-      const n = num++;
-      orders.push({ orderId: 'PRACTICE' + (1000 + n), extraOrderIds: [], buyer: b, buyerKey: nameKey(b), items: [{ title: `Mystery Squishy #${n}`, name: 'Mystery Squishy', num: n, qty: 1, price: +(3 + ((n * 37) % 13)).toFixed(2) }], slipPages: [], labelPages: [], tracking: [], firstSeq: n });
-    }
+    const items = [];
+    for (let k = 0; k < weights[bi]; k++) { const n = num++; items.push({ title: `Mystery Squishy #${n}`, name: 'Mystery Squishy', num: n, qty: 1, price: +(3 + ((n * 37) % 13)).toFixed(2) }); }
+    orders.push({ orderId: 'PRACTICE' + (1000 + bi), extraOrderIds: [], buyer: b, buyerKey: nameKey(b), items, slipPages: [], labelPages: [], tracking: [], firstSeq: bi });
   });
   const byBuyer = new Map();
   orders.forEach(o => { if (!byBuyer.has(o.buyerKey)) byBuyer.set(o.buyerKey, '9400' + String(1e17 + Math.floor(Math.random() * 9e17)).slice(0, 18)); o.tracking = [byBuyer.get(o.buyerKey)]; });
-  const plan = planShow(orders, prefs().perTray);
+  const plan = planShow(orders);
   const id = db.uid('show');
-  await db.createShow({ id, name: 'Practice show', date: today(), platform: 'tiktok', createdAt: Date.now(), trayCount: plan.trays.length, itemCount: plan.items.length, hasLabels: false, noNumber: 0, sample: true, perTray: prefs().perTray }, plan, []);
+  await db.createShow({ id, name: 'Practice show', date: today(), platform: 'tiktok', createdAt: Date.now(), trayCount: plan.trays.length, itemCount: plan.items.length, hasLabels: false, noNumber: 0, sample: true }, plan, []);
   setShowId(id);
   toast('Practice show ready. Print its stickers on Pre-show labels ("Mystery Squishy", 1 to ' + (num - 1) + '), or just type the numbers.', 'ok');
   location.hash = '#show/' + id + '/overview';
@@ -525,8 +523,7 @@ function viewSettings() {
   <h1>Settings</h1>
   ${S.owner ? `<section class="panel"><h2>Packing</h2>
     <label>Packing mode<select id="p-mode"><option value="post" selected>Post-show — sort everything after the live</option><option value="live" disabled>Live — trays as items sell (needs a live sales feed; TikTok doesn't share one)</option></select></label>
-    <label>Items per tray (most)<input type="number" id="p-per" min="4" max="100" value="${p.perTray}"></label>
-    <span class="muted small">A buyer with more items gets more than one tray. Applies to shows imported from now on.</span>
+    <p class="muted small">Trays: one per package, biggest package gets Tray 1 — the same as Scan2Tray.</p>
     ${tog('p-count', p.itemCount, 'Show item count on labels', 'Stamps "N items" next to the tray number on shipping labels.')}
     ${tog('p-hide', p.hideRevenue, 'Hide show revenue', 'Hides sales amounts on every screen — handy when packers look at the screen.')}
   </section>` : ''}
@@ -562,7 +559,6 @@ function viewSettings() {
   const num = (id, key) => { const el = $('#' + id); el.onchange = () => { const v = parseInt(el.value, 10); if (v >= 10) { S.settings[key] = v; saveLocal(); toast('Saved', 'ok'); } }; };
   num('d-w', 'labelWidthMm'); num('d-h', 'labelHeightMm');
   if (S.owner) {
-    $('#p-per').onchange = e => { const v = parseInt(e.target.value, 10); if (v >= 4 && v <= 100) db.savePrefs({ perTray: v }).then(() => toast('Saved', 'ok')); };
     $('#p-count').onchange = e => db.savePrefs({ itemCount: e.target.checked }).then(() => toast('Saved', 'ok'));
     $('#p-hide').onchange = e => db.savePrefs({ hideRevenue: e.target.checked }).then(() => toast('Saved', 'ok'));
   }

@@ -61,6 +61,8 @@ export function classifyPage(text) {
 }
 
 export function findBuyer(lines) {
+  // TikTok packing slips: "Buyer ID: .tattedmama44" (the @username) — the most reliable handle
+  for (const l of lines) { const m = l.match(/buyer\s*id\s*[:\-]\s*(\S+)/i); if (m) return m[1].replace(/^@/, ''); }
   const patterns = [
     /(?:buyer\s*(?:username|name|nickname)?|username|nickname)\s*[:\-]\s*(.+)/i,
     /(?:ship\s*to|deliver\s*to|recipient(?:\s*name)?|customer(?:\s*name)?|sold\s*to)\s*[:\-]?\s*(.*)/i,
@@ -79,6 +81,11 @@ export function findBuyer(lines) {
   const at = lines.join(' ').match(/@([A-Za-z0-9._]{2,30})/);
   return at ? '@' + at[1] : '';
 }
+// Nickname shown next to the handle (for display only)
+export function findNickname(lines) {
+  for (const l of lines) { const m = l.match(/buyer\s*nickname\s*[:\-]\s*(.+)/i); if (m) return m[1].trim().slice(0, 40); }
+  return '';
+}
 
 export function buyerKey(name) {
   return String(name || '').toLowerCase().replace(/^@/, '').replace(/[^a-z0-9]+/g, '');
@@ -91,8 +98,25 @@ function esc(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 // Titles can wrap onto a second line, so a short piece before "#67" takes the line above as well.
 const NOT_ITEM = /\b(order|tracking|invoice|page|package|po box|apt|suite|unit|ste)\b\s*$/i;
 const HEADER = /(product\s*name|item\s*name|\bsku\b|\bqty\b|quantity|order\s*id|buyer|ship\s*to|packing\s*(slip|list)|:)/i;
+// TikTok packing-slip table row: "<product name> <SKU> <seller SKU> $7.00 1" — the sticker number is the SKU.
+const ROW = /^(.+?)\s+([A-Za-z0-9._-]{1,24})(?:\s+([A-Za-z0-9._-]{1,24}))?\s+\$\s?(\d{1,6}(?:\.\d{1,2})?)\s+(\d{1,3})$/;
 export function findItems(text) {
   const lines = text.split('\n');
+  const table = [];
+  for (const line of lines) {
+    if (HEADER.test(line) && !/\$\s?\d/.test(line)) continue;
+    const m = line.trim().match(ROW);
+    if (!m) continue;
+    let name = m[1].trim();
+    const hash = name.match(/#\s?(\d{1,5})\s*$/);
+    const sku = [m[2], m[3]].find(v => v && /^\d{1,5}$/.test(v));
+    const num = hash ? +hash[1] : sku != null ? +sku : null;
+    if (hash) name = name.slice(0, hash.index).trim();
+    if (num == null) continue;
+    const qty = +m[5] || 1;
+    table.push({ title: (name + ' #' + num).trim(), name, num, qty, price: +m[4] || 0 });
+  }
+  if (table.length) return table;
   const out = [];
   lines.forEach((line, li) => {
     for (const m of line.matchAll(/#\s?(\d{1,5})(?![\d])/g)) {
@@ -127,19 +151,22 @@ export async function parsePdfs(files, onProgress) {
   const orders = new Map();
   const labels = [];
   const seq = [];
-  for (const f of files) {
+  for (const [fileIdx, f] of files.entries()) {
     const pages = await extractPages(f.bytes);
     for (const p of pages) {
       onProgress && onProgress(`${f.name}: page ${p.pageIndex + 1} of ${pages.length}`);
       const kind = classifyPage(p.text);
       const ids = findOrderIds(p.text);
       const entry = { fileId: f.id, pageIndex: p.pageIndex, kind, ids, tracking: kind === 'slip' ? [] : findTracking(p.text) };
+      const slipTracking = kind === 'slip' ? findTracking(p.text.split('\n').filter(l => /tracking/i.test(l)).join('\n')) : [];
       seq.push(entry);
       if (kind === 'slip') {
         const oid = ids[0] || `slip-${f.id}-${p.pageIndex}`;
         let o = orders.get(oid);
-        if (!o) { o = { orderId: oid, extraOrderIds: ids.slice(1), buyer: '', items: [], slipPages: [], labelPages: [], tracking: [], firstSeq: seq.length }; orders.set(oid, o); }
+        if (!o) { o = { orderId: oid, extraOrderIds: ids.slice(1), buyer: '', items: [], slipPages: [], labelPages: [], tracking: [], firstSeq: seq.length, fileIdx }; orders.set(oid, o); }
         o.buyer = o.buyer || findBuyer(p.lines);
+        o.nickname = o.nickname || findNickname(p.lines);
+        slipTracking.forEach(t => { if (!o.tracking.includes(t)) o.tracking.push(t); });
         for (const it of findItems(p.text)) if (!o.items.some(x => x.num === it.num && nameKey(x.name) === nameKey(it.name))) o.items.push(it);
         o.slipPages.push({ fileId: f.id, pageIndex: p.pageIndex });
         entry.order = o;
@@ -233,29 +260,21 @@ export function ordersFromCsv(text) {
   return { orders: list, unmatchedLabels: [], pageCount: 0, labelPages: 0 };
 }
 
-// Build trays the Scan2Tray "post-show" way: the buyer with the most items gets Tray 1, and so on.
-// A tray holds at most `perTray` items; bigger buyers get extra trays, placed by their size.
-export function planShow(orders, perTray = 24) {
-  const groups = new Map();
-  for (const o of orders) {
-    let g = groups.get(o.buyerKey);
-    if (!g) { g = { buyerKey: o.buyerKey, buyer: o.buyer || 'Unknown buyer', orders: [], items: [], seq: o.firstSeq ?? 0 }; groups.set(o.buyerKey, g); }
-    g.orders.push(o);
-    for (const it of o.items) for (let q = 0; q < Math.max(1, it.qty || 1); q++) g.items.push({ ...it, orderId: o.orderId });
-    if (!o.items.length) g.items.push({ title: 'Item without a sticker number', name: '', num: null, qty: 1, price: 0, orderId: o.orderId, noNum: true });
-  }
-  const chunks = [];
-  for (const g of groups.values()) {
-    g.items.sort((a, b) => (a.num ?? 1e9) - (b.num ?? 1e9));
-    for (let i = 0; i < g.items.length; i += perTray) chunks.push({ g, items: g.items.slice(i, i + perTray), part: i / perTray });
-  }
-  chunks.sort((a, b) => b.items.length - a.items.length || a.g.seq - b.g.seq || a.part - b.part);
+// Build trays exactly like Scan2Tray's "Pack a finished show": one tray per package (each package has
+// its own shipping label). Most items first; ties keep the order the packages appear in the PDFs.
+export function planShow(orders) {
+  const list = orders.map(o => {
+    const items = [];
+    for (const it of o.items) for (let q = 0; q < Math.max(1, it.qty || 1); q++) items.push({ ...it, orderId: o.orderId });
+    if (!o.items.length) items.push({ title: 'Item without a sticker number', name: '', num: null, qty: 1, price: 0, orderId: o.orderId, noNum: true });
+    items.sort((a, b) => (a.num ?? 1e9) - (b.num ?? 1e9));
+    return { o, items, user: String(o.buyer || '').toLowerCase() };
+  });
+  list.sort((a, b) => b.items.length - a.items.length || (a.o.firstSeq || 0) - (b.o.firstSeq || 0));
   const trays = [], items = [];
-  chunks.forEach((c, i) => {
+  list.forEach((c, i) => {
     const n = i + 1;
-    const orderIds = [...new Set(c.items.map(x => x.orderId))];
-    const tracking = [...new Set(c.g.orders.filter(o => orderIds.includes(o.orderId)).flatMap(o => o.tracking || []))];
-    const t = { n, buyer: c.g.buyer, buyerKey: c.g.buyerKey, orderIds, items: [], tracking, part: c.part };
+    const t = { n, buyer: c.o.buyer || 'Unknown buyer', nickname: c.o.nickname || '', buyerKey: c.o.buyerKey, orderIds: [c.o.orderId], items: [], tracking: [...(c.o.tracking || [])], part: 0 };
     c.items.forEach((x, j) => {
       const id = `${n}-${j}`;
       items.push({ id, num: x.num, name: x.name, code: x.num != null ? stickerCode(x.name, x.num) : '', title: x.title, price: x.price || 0, tray: n, orderId: x.orderId, noNum: !!x.noNum });
@@ -263,6 +282,6 @@ export function planShow(orders, perTray = 24) {
     });
     trays.push(t);
   });
-  const slim = orders.map(o => ({ orderId: o.orderId, extraOrderIds: o.extraOrderIds, buyer: o.buyer, buyerKey: o.buyerKey, slipPages: o.slipPages, labelPages: o.labelPages, tracking: o.tracking, firstSeq: o.firstSeq }));
+  const slim = orders.map(o => ({ orderId: o.orderId, extraOrderIds: o.extraOrderIds, buyer: o.buyer, nickname: o.nickname, buyerKey: o.buyerKey, slipPages: o.slipPages, labelPages: o.labelPages, tracking: o.tracking, firstSeq: o.firstSeq, fileIdx: o.fileIdx }));
   return { trays, items, orders: slim };
 }
